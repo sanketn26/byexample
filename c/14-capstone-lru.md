@@ -1,4 +1,4 @@
-# C 13 — Capstone: an LRU Cache
+# C 14 — Capstone: an LRU Cache
 
 A *least-recently-used* cache keeps the N most recently touched entries and
 evicts the stalest. In C there is no map or list in the library, so you
@@ -414,4 +414,4 @@ int main(void) {
 
 </details>
 
-Back to the [course index](README.md)
+Next: [15 — Streaming](15-streaming.md)

@@ -19,4 +19,11 @@ but report `FAIL` until solved.
 | 10 | [Files and I/O](10-files-io.md) | `FILE *`, binary I/O, `fgets`, `sscanf` |
 | 11 | [**Idiomatic C**](11-idiomatic-c.md) | X-macros, opaque types, `restrict`, the checklist |
 | 12 | [Threads](12-threads.md) | `pthreads`, mutexes, condition variables, C11 atomics |
-| 13 | [Capstone: LRU cache](13-capstone-lru.md) | hash table + intrusive list, ownership |
+| 13 | [Testing](13-testing.md) | `assert`, a tiny harness, table-driven cases, fakes via function pointers |
+| 14 | [Capstone: LRU cache](14-capstone-lru.md) | hash table + intrusive list, ownership |
+| 15 | [Streaming](15-streaming.md) | short reads and writes, frames, atomic replace |
+| 16 | [Network programming](16-network.md) | TCP frames, `poll`, HTTP/1.1 by hand |
+| 17 | [Advanced concurrency](17-advanced-concurrency.md) | bounded pools, deadlines, backpressure, shutdown |
+
+Lessons 15–17 are the outside world: bytes in chunks, a socket, and a bound
+on how many of those you handle at once.

@@ -18,4 +18,12 @@ Rust 2021 edition. Each lesson is a single file you can build with
 | 10 | [Files and I/O](10-files-io.md) | `Read`/`Write`, `BufReader`, paths, processes |
 | 11 | [Concurrency](11-concurrency.md) | threads, scope, channels, `Arc<Mutex>`, atomics |
 | 12 | [**Idiomatic Rust**](12-idiomatic-rust.md) | combinators, builders, type-state, the checklist |
-| 13 | [Capstone: LRU cache](13-capstone-lru.md) | index-linked list arena + `HashMap` |
+| 13 | [Testing](13-testing.md) | `#[test]`, `rustc --test`, `Result` tests, trait fakes, `catch_unwind` |
+| 14 | [Capstone: LRU cache](14-capstone-lru.md) | index-linked list arena + `HashMap` |
+| 15 | [Streaming](15-streaming.md) | short reads and writes, frames, atomic replace |
+| 16 | [Network programming](16-network.md) | `std::net`, frames, timeouts, HTTP/1.1 by hand |
+| 17 | [Advanced concurrency](17-advanced-concurrency.md) | bounded pools, deadlines, backpressure, shutdown |
+
+Lessons 15–17 are the outside world: bytes in chunks, a socket, and a bound
+on how many of those you handle at once. Async Rust (Tokio) needs Cargo, so
+lesson 16 stays on `std::net` and threads.

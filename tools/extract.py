@@ -19,6 +19,11 @@ RUN = {
     "python": "python3 {f}",
     "go": "go run {f}",
     "rust": "rustc --edition 2021 -o {b} {f} && ./{b}",
+    "shell": "bash {f}",
+    "sql": "python3 {tools}/sqlrun.py {f}",
+    "k8s": "bash {f}",
+    "helm": "bash {f}",
+    "aws": "bash {f}",
     "c": "gcc -std=c11 -Wall -Wextra -g -pthread -fsanitize=address,undefined -o {b} {f} -lm && ./{b}",
 }
 
@@ -33,7 +38,7 @@ def main():
     md = args.lesson.resolve()
     lang = md.parent.name
     if lang not in RUN:
-        sys.exit(f"{md}: expected the file to live in python/, go/, rust/ or c/")
+        sys.exit(f"{md}: expected the file to live in one of: {', '.join(RUN)}")
     dest = args.out / f"{lang}-{md.stem}"
     dest.mkdir(parents=True, exist_ok=True)
 
@@ -51,7 +56,7 @@ def main():
     print(f"wrote {', '.join(written)} to {dest}/")
     for name in written:
         if name.startswith("exercise"):
-            cmd = RUN[lang].format(f=name, b=Path(name).stem)
+            cmd = RUN[lang].format(f=name, b=Path(name).stem, tools=Path(__file__).resolve().parent)
             print(f"practise:  cd {dest} && {cmd}")
 
 

@@ -1,0 +1,27 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [python, go, rust, c, shell, sql]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        if: matrix.lang == 'go'
+        with:
+          go-version: "1.23"
+      - name: Use stable Rust
+        if: matrix.lang == 'rust'
+        run: rustup update stable && rustup default stable
+      - name: Run every example and solution
+        run: make verify-${{ matrix.lang }}

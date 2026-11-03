@@ -1,16 +1,18 @@
 # By Example — a practice-first programming course
 
-Learn **Python, Go, Rust and C** the *by example* way: every lesson is a
+Learn **Python, Go, Rust, C, the Unix shell and SQL** the *by example* way: every lesson is a
 short, annotated, runnable program with its real output, the details that
 trip people up, and graded exercises with a hidden solution. Light on
 theory, heavy on practice, and nothing important left out.
 
 | Language | Start here | Lessons |
 |----------|-----------|---------|
-| Python 3.12 | [python/](python/README.md) | 14 (incl. *The Pythonic Way*, asyncio, testing, capstone) |
-| Go 1.23+ | [go/](go/README.md) | 13 (incl. concurrency, *Idiomatic Go*, capstone) |
-| Rust 2021 | [rust/](rust/README.md) | 13 (incl. concurrency, *Idiomatic Rust*, capstone) |
-| C11 | [c/](c/README.md) | 13 (incl. threads, *Idiomatic C*, capstone) |
+| Python 3.12 | [python/](python/README.md) | 17 (incl. *The Pythonic Way*, asyncio, testing, capstone, streaming, network, advanced concurrency) |
+| Go 1.23+ | [go/](go/README.md) | 17 (incl. concurrency, *Idiomatic Go*, testing, capstone, streaming, network, advanced concurrency) |
+| Rust 2021 | [rust/](rust/README.md) | 17 (incl. concurrency, *Idiomatic Rust*, testing, capstone, streaming, network, advanced concurrency) |
+| C11 | [c/](c/README.md) | 17 (incl. threads, *Idiomatic C*, testing, capstone, streaming, network, advanced concurrency) |
+| Bash 4.4+ (and POSIX sh) | [shell/](shell/README.md) | 15 (incl. strict mode, text tools, `find`, `getopts`, testing, capstone, portable `sh`) |
+| SQL (SQLite 3.35+) | [sql/](sql/README.md) | 15 (incl. joins, window functions, transactions, indexes and plans, JSON, recursive CTEs, capstone, dialects) |
 
 Every language follows the same arc, so you can learn a second language by
 walking the same path:
@@ -28,6 +30,10 @@ walking the same path:
 | 09 | Abstraction | Interfaces, traits, protocols, vtables |
 | 10 | Files and I/O | Talk to the outside world |
 | 11+ | Concurrency, **Idiomatic X**, testing, capstone (LRU cache) | Write it the way experts do |
+| last three | Streaming, network, advanced concurrency | Move bytes, speak a protocol, bound the work |
+
+The lessons line up across languages: capstone is 14 and the
+outside-world lessons are 15–17 in all four.
 
 ## Anatomy of a lesson
 
@@ -74,7 +80,8 @@ make verify-rust       # one language
 
 Toolchains it needs on `PATH`: `python3` (3.12+), `go` (1.23+), `rustc`
 (2021 edition, built with `-D warnings`), `gcc` (C11, built with
-`-Wall -Wextra -Werror -fsanitize=address,undefined`).
+`-Wall -Wextra -Werror -fsanitize=address,undefined`), `bash` 4.4+ with `jq`
+(shell), and Python's built-in `sqlite3` module (sql, via `tools/sqlrun.py`).
 
 ## Contributing a lesson
 
@@ -83,3 +90,7 @@ Toolchains it needs on `PATH`: `python3` (3.12+), `go` (1.23+), `rustc`
   `solution.*`) and ```` ```text output ```` for expected output.
 * Exercises print `PASS`/`FAIL` per check and exit non-zero on any failure.
 * Run `make verify-<lang>` before opening a PR.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

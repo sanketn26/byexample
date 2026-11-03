@@ -10,6 +10,7 @@ Fence conventions inside a lesson:
 
 Usage: verify.py [lang|path.md ...]
 """
+import os
 import re
 import subprocess
 import sys
@@ -24,24 +25,39 @@ TOOLS = {
     "python": (None, ["python3", "-I", "{f}"]),
     "go": (None, ["go", "run", "{f}"]),
     "rust": (["rustc", "--edition", "2021", "-D", "warnings", "-o", "{o}", "{f}"], ["{o}"]),
+    "shell": (None, ["bash", "{f}"]),
+    "sql": (None, ["python3", "-I", "{tools}/sqlrun.py", "{f}"]),
+    "k8s": (None, ["bash", "{f}"]),
+    "helm": (None, ["bash", "{f}"]),
+    "aws": (None, ["bash", "{f}"]),
     "c": (["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
            "-g", "-pthread", "-o", "{o}", "{f}", "-lm"], ["{o}"]),
 }
 
 
-def run(cmd, cwd):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+# track -> file suffix of runnable blocks; other file= blocks are support files
+SUFFIX = {"shell": ".sh", "sql": ".sql", "k8s": ".sh", "helm": ".sh", "aws": ".sh"}
+SLOW = {"k8s": 600, "helm": 600}  # tracks that talk to a cluster get longer
+
+
+def run(cmd, cwd, lang=None):
+    env = dict(os.environ, BYEXAMPLE_TRACK=lang or "")
+    # shell-like tracks document what a terminal shows, so stderr is merged in
+    merge = lang in SUFFIX and lang != "sql"
+    return subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                          text=True, timeout=SLOW.get(lang, 120), env=env)
 
 
 def execute(lang, path: Path, tmp: Path):
     build, runner = TOOLS[lang]
     out = tmp / (path.stem + ".bin")
-    sub = lambda cmd: [c.format(f=path.name, o=out) for c in cmd]
+    sub = lambda cmd: [c.format(f=path.name, o=out, tools=ROOT / "tools") for c in cmd]
     if build:
-        b = run(sub(build), tmp)
+        b = run(sub(build), tmp, lang)
         if b.returncode != 0:
             return None, b
-    return run(sub(runner), tmp), None
+    return run(sub(runner), tmp, lang), None
 
 
 def verify(md: Path) -> list[str]:
@@ -71,6 +87,10 @@ def verify(md: Path) -> list[str]:
         for name, body in files.items():
             (tmp / name).write_text(body)
         for name in sorted(files):
+            if name.split(".")[0] not in ("example", "exercise", "solution"):
+                continue  # support file
+            if lang in SUFFIX and not name.endswith(SUFFIX[lang]):
+                continue
             res, build_err = execute(lang, tmp / name, tmp)
             kind = name.split(".")[0]
             if kind == "exercise":

@@ -1,4 +1,4 @@
-# Go 13 — Capstone: an LRU Cache
+# Go 14 — Capstone: an LRU Cache
 
 A *least-recently-used* cache keeps the N most recently touched entries and
 evicts the stalest. It pulls together generics, structs and methods, maps,
@@ -316,4 +316,4 @@ func main() {
 
 </details>
 
-Back to the [course index](README.md)
+Next: [15 — Streaming](15-streaming.md)

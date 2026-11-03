@@ -18,6 +18,12 @@ Python 3.12+. Run any lesson's code with `python3 file.py`.
 | 12 | [asyncio](12-asyncio.md) | tasks, `gather`, `TaskGroup`, queues, cancellation |
 | 13 | [Testing](13-testing.md) | `unittest`, fakes, `mock`, `doctest`, dependency injection |
 | 14 | [Capstone: LRU cache](14-capstone-lru.md) | a real data structure, start to finish |
+| 15 | [Streaming](15-streaming.md) | short reads and writes, frames, atomic replace |
+| 16 | [Network programming](16-network.md) | TCP frames, timeouts, HTTP/1.1, asyncio streams |
+| 17 | [Advanced concurrency](17-advanced-concurrency.md) | bounded pools, deadlines, backpressure, shutdown |
 
 Start at 01, or jump to 11 if you already know the language and want the
 idioms.
+
+Lessons 15–17 are the outside world: bytes in chunks, a socket, and a bound
+on how many of those you handle at once.

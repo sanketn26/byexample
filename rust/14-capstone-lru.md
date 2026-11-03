@@ -1,4 +1,4 @@
-# Rust 13 — Capstone: an LRU Cache
+# Rust 14 — Capstone: an LRU Cache
 
 A *least-recently-used* cache keeps the N most recently touched entries and
 evicts the stalest. In safe Rust a pointer-linked list fights the borrow
@@ -339,4 +339,4 @@ fn main() {
 
 </details>
 
-Back to the [course index](README.md)
+Next: [15 — Streaming](15-streaming.md)

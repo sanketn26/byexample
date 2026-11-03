@@ -17,4 +17,11 @@ Exercises use a tiny `check` helper and exit non-zero until solved.
 | 10 | [Files and I/O](10-files-io.md) | `os`, `bufio`, `encoding/json`, `exec` |
 | 11 | [Concurrency](11-concurrency.md) | goroutines, channels, `sync`, `context` |
 | 12 | [**Idiomatic Go**](12-idiomatic-go.md) | options, enums, zero values, the checklist |
-| 13 | [Capstone: LRU cache](13-capstone-lru.md) | generics, `container/list`, maps |
+| 13 | [Testing](13-testing.md) | `testing`, table-driven tests, fakes, `httptest`-style injection |
+| 14 | [Capstone: LRU cache](14-capstone-lru.md) | generics, `container/list`, maps |
+| 15 | [Streaming](15-streaming.md) | short reads and writes, frames, atomic replace |
+| 16 | [Network programming](16-network.md) | TCP frames, deadlines, `net/http` |
+| 17 | [Advanced concurrency](17-advanced-concurrency.md) | bounded pools, `context`, backpressure, shutdown |
+
+Lessons 15–17 are the outside world: bytes in chunks, a socket, and a bound
+on how many of those you handle at once.
