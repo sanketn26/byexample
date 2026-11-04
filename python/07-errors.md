@@ -1,12 +1,16 @@
 # Python 07 — Errors and Exceptions
 
-Python signals failure with exceptions. The style is EAFP: *easier to ask
-forgiveness than permission* — try the operation and handle the failure.
+Python signals failure with exceptions. The style is EAFP: easier to ask
+forgiveness than permission. Try the operation and handle the failure.
 
-## Example
+## `else` runs only on success, `finally` always runs
 
-```python file=example.py
-# Basic try / except / else / finally
+`except` handles one type. `else` runs when the `try` raised nothing.
+`finally` runs on the way out, including on `return`. A `return` inside
+`finally` replaces the pending result and swallows an exception. Don't
+write one.
+
+```python file=n01.py
 def parse(text):
     try:
         value = int(text)
@@ -14,102 +18,24 @@ def parse(text):
         print("  bad input:", e)
         return None
     else:
-        print("  parsed ok")        # runs only if no exception
+        print("  parsed ok")
         return value
     finally:
-        print("  done with", repr(text))   # always runs
+        print("  done with", repr(text))
+
 
 print(parse("42"))
 print(parse("4x2"))
 
-# Catch several types; order matters (most specific first)
-def lookup(d, k):
+
+def report():
     try:
-        return d[k]
-    except (KeyError, IndexError) as e:
-        return f"missing {e!r}"
-
-print(lookup({"a": 1}, "b"), lookup([1], 5))
-
-# Raising, and custom exception types
-class ValidationError(Exception):
-    def __init__(self, field, message):
-        super().__init__(f"{field}: {message}")
-        self.field = field
-
-def validate_age(age):
-    if not isinstance(age, int):
-        raise ValidationError("age", "must be an int")
-    if age < 0:
-        raise ValidationError("age", "must be >= 0")
-    return age
-
-try:
-    validate_age(-1)
-except ValidationError as e:
-    print(e, "| field =", e.field)
-
-# Exception chaining: preserve the original cause
-def load_port(cfg):
-    try:
-        return int(cfg["port"])
-    except (KeyError, ValueError) as e:
-        raise RuntimeError("bad config") from e
-
-try:
-    load_port({"port": "http"})
-except RuntimeError as e:
-    print(e, "<-", repr(e.__cause__))
-
-# Context managers guarantee cleanup
-class Resource:
-    def __enter__(self):
-        print("acquire")
-        return self
-    def __exit__(self, exc_type, exc, tb):
-        print("release", exc_type.__name__ if exc_type else None)
-        return False                 # False: do not swallow the exception
-
-try:
-    with Resource():
-        raise KeyError("boom")
-except KeyError:
-    print("caught after release")
-
-# contextlib makes this shorter
-from contextlib import contextmanager, suppress
-
-@contextmanager
-def tag(name):
-    print(f"<{name}>")
-    try:
-        yield
+        return "value"
     finally:
-        print(f"</{name}>")
+        print("finally ran")
 
-with tag("b"):
-    print("text")
 
-with suppress(FileNotFoundError):
-    open("/definitely/not/here")
-print("suppressed")
-
-# The hierarchy: catch Exception, never a bare `except:`
-print(issubclass(KeyError, LookupError), issubclass(KeyboardInterrupt, Exception))
-
-# assert is for programmer errors; it can be disabled with -O
-try:
-    assert 1 + 1 == 3, "math broke"
-except AssertionError as e:
-    print("assertion:", e)
-
-# ExceptionGroup / except* (3.11+) for concurrent failures
-try:
-    raise ExceptionGroup("batch", [ValueError("a"), TypeError("b")])
-except* ValueError as eg:
-    print("value errors:", [str(e) for e in eg.exceptions])
-except* TypeError as eg:
-    print("type errors:", [str(e) for e in eg.exceptions])
+print(report())
 ```
 
 ```text output
@@ -119,35 +45,272 @@ except* TypeError as eg:
   bad input: invalid literal for int() with base 10: '4x2'
   done with '4x2'
 None
+finally ran
+value
+```
+
+## The first matching `except` wins
+
+A tuple catches several types. Put the more specific type first: `KeyError`
+is a `LookupError`, so a handler for the base class hides the subclass.
+
+```python file=n02.py
+def lookup(d, k):
+    try:
+        return d[k]
+    except (KeyError, IndexError) as e:
+        return f"missing {e!r}"
+
+
+print(lookup({"a": 1}, "b"), lookup([1], 5))
+try:
+    raise KeyError("k")
+except LookupError:
+    print("lookup")
+except KeyError:
+    print("key")
+```
+
+```text output
 missing KeyError('b') missing IndexError('list index out of range')
+lookup
+```
+
+## Raise a type of your own
+
+Subclass `Exception`, not `BaseException`. `super().__init__` sets the
+message. Extra attributes travel on the instance.
+
+```python file=n03.py
+class ValidationError(Exception):
+    def __init__(self, field, message):
+        super().__init__(f"{field}: {message}")
+        self.field = field
+
+
+def validate_age(age):
+    if not isinstance(age, int):
+        raise ValidationError("age", "must be an int")
+    if age < 0:
+        raise ValidationError("age", "must be >= 0")
+    return age
+
+
+try:
+    validate_age(-1)
+except ValidationError as e:
+    print(e, "| field =", e.field)
+```
+
+```text output
 age: must be >= 0 | field = age
+```
+
+## `raise` can chain or re-raise
+
+`raise RuntimeError(...) from e` stores `e` on `__cause__`. A bare `raise`
+re-raises the active exception and keeps its traceback. `raise e` adds a
+frame, so that traceback is longer.
+
+```python file=n04.py
+import traceback
+
+
+def load_port(cfg):
+    try:
+        return int(cfg["port"])
+    except (KeyError, ValueError) as e:
+        raise RuntimeError("bad config") from e
+
+
+def via_bare():
+    try:
+        raise ValueError("v")
+    except ValueError:
+        raise
+
+
+def via_name():
+    try:
+        raise ValueError("v")
+    except ValueError as e:
+        raise e
+
+
+def frames(fn):
+    try:
+        fn()
+    except ValueError as err:
+        return len(traceback.extract_tb(err.__traceback__))
+
+
+try:
+    load_port({"port": "http"})
+except RuntimeError as e:
+    print(e, "<-", repr(e.__cause__))
+print(frames(via_bare) < frames(via_name))
+```
+
+```text output
 bad config <- ValueError("invalid literal for int() with base 10: 'http'")
+True
+```
+
+## `with` runs the cleanup
+
+`__enter__` acquires and `__exit__` releases. Returning a false value from
+`__exit__` does not swallow the exception, so the `KeyError` still propagates.
+
+```python file=n05.py
+class Resource:
+    def __enter__(self):
+        print("acquire")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        print("release", exc_type.__name__ if exc_type else None)
+        return False
+
+
+try:
+    with Resource():
+        raise KeyError("boom")
+except KeyError:
+    print("caught after release")
+```
+
+```text output
 acquire
 release KeyError
 caught after release
+```
+
+## `@contextmanager` is the short form
+
+Code before `yield` is setup. The `finally` after `yield` is cleanup.
+`suppress` ignores the named exceptions and nothing else.
+
+```python file=n06.py
+from contextlib import contextmanager, suppress
+
+
+@contextmanager
+def tag(name):
+    print(f"<{name}>")
+    try:
+        yield
+    finally:
+        print(f"</{name}>")
+
+
+with tag("b"):
+    print("text")
+
+with suppress(FileNotFoundError):
+    open("/definitely/not/here")
+print("suppressed")
+```
+
+```text output
 <b>
 text
 </b>
 suppressed
-True False
+```
+
+## Catch `Exception`, never a bare `except`
+
+A bare `except:` also catches `KeyboardInterrupt` and `SystemExit`. Those
+inherit from `BaseException`, not from `Exception`. `Exception` is the
+widest handler you want.
+
+```python file=n07.py
+print(
+    issubclass(KeyError, LookupError),
+    issubclass(KeyboardInterrupt, Exception),
+    issubclass(SystemExit, Exception),
+)
+```
+
+```text output
+True False False
+```
+
+## The `as` name ends with the block
+
+At the end of `except ... as e`, Python deletes `e` so the traceback can
+be freed. Using the name afterwards raises `NameError`.
+
+```python file=n08.py
+try:
+    try:
+        raise ValueError("z")
+    except ValueError as e:
+        print("caught", e)
+    print(e)
+except NameError as e:
+    print(type(e).__name__)
+```
+
+```text output
+caught z
+NameError
+```
+
+## `assert` is for programmer errors
+
+A failed assert raises `AssertionError`. Running with `-O` strips assert
+statements, so they are not a runtime check of user input.
+
+```python file=n09.py
+try:
+    assert 1 + 1 == 3, "math broke"
+except AssertionError as e:
+    print("assertion:", e)
+```
+
+```text output
 assertion: math broke
+```
+
+## `except*` splits an `ExceptionGroup`
+
+One `raise` can carry several failures. Each `except*` handles one type
+and leaves the rest for the next clause. This needs Python 3.11 or newer.
+
+```python file=n10.py
+try:
+    raise ExceptionGroup("batch", [ValueError("a"), TypeError("b")])
+except* ValueError as eg:
+    print("value errors:", [str(e) for e in eg.exceptions])
+except* TypeError as eg:
+    print("type errors:", [str(e) for e in eg.exceptions])
+```
+
+```text output
 value errors: ['a']
 type errors: ['b']
 ```
 
-## Details that bite
+## Don't use exceptions as the normal path of a hot loop
 
-- A bare `except:` also catches `KeyboardInterrupt` and `SystemExit`. Catch
-  `Exception` at the broadest.
-- `finally` runs even on `return`; a `return` inside `finally` swallows
-  exceptions — don't.
-- `raise` with no argument re-raises the active exception, preserving its
-  traceback. `raise e` adds a frame; `raise X from e` sets `__cause__`.
-- The `as e` name is deleted at the end of the `except` block.
-- Don't use exceptions for ordinary control flow *inside hot loops*;
-  `try` is cheap when nothing is raised, `raise` is not.
-- LBYL (`if key in d`) can race with other threads or processes; EAFP
-  doesn't.
+`try` is cheap when nothing is raised. Raising is not. `if key in d` can
+race with another thread that changes the dict; the `try` form does not.
+
+```python file=n11.py
+d = {"a": 1}
+if "a" in d:
+    print(d["a"])
+try:
+    print(d["missing"])
+except KeyError:
+    print("missing")
+```
+
+```text output
+1
+missing
+```
 
 ## Exercises
 

@@ -1,14 +1,21 @@
 # Python 17 — Advanced concurrency
 
-One thread per request, with no ceiling, fails by exhausting memory
-or file descriptors. Bound how many calls run at once, bound how many jobs
-wait, put a deadline on the whole operation, and make shutdown something
-the workers can see. The pool below is the shape of a server in front of
-the sockets from the previous lesson.
+One thread per request, with no ceiling, fails by exhausting memory or file
+descriptors. Bound how many calls run at once, bound how many jobs wait,
+put a deadline on the whole operation, and make shutdown something the
+workers can see. `asyncio` has the same three knobs: a semaphore for the
+in-flight cap, `asyncio.timeout` for the deadline, and a bounded queue for
+backpressure. Threads are here because the blocking call is the interesting
+case.
 
-## Example
+## The pool's high-water mark stays at the worker count
 
-```python file=example.py
+`max_in` is the number you have to be able to explain. If it climbs past
+the worker count, the bound is not real: something started work outside
+the pool. The gate below holds every worker inside `fn` at once, so the
+overlap is visible.
+
+```python file=n01.py
 import queue
 import threading
 
@@ -60,26 +67,91 @@ def run_pool(workers, jobs, fn):
 
 results, max_in = run_pool(2, [0, 1, 2, 3], lambda n: n * n)
 print("pool", results, max_in)
+```
 
-r, w = __import__("os").pipe()
+```text output
+pool [0, 1, 4, 9] 2
+```
+
+## A deadline gives up while the call is still blocked
+
+`Thread.join(timeout)` and `Event.wait(timeout)` bound the wait. A socket
+timeout that retries forever is not a deadline for the whole operation.
+This thread is a daemon: a non-daemon thread keeps the interpreter alive,
+and joining it forever would turn the deadline into a hang. A daemon is
+for work you are willing to abandon.
+
+```python file=n02.py
+import os
+import threading
+
+r, w = os.pipe()
 box = {}
 
+
 def blocked():
-    __import__("os").read(r, 1)
-    return "done"
+    os.read(r, 1)
+    box["v"] = "done"
 
-outcome = []
 
-def target():
-    box["v"] = blocked()
-
-t = threading.Thread(target=target, daemon=True)
+t = threading.Thread(target=blocked, daemon=True)
 t.start()
 t.join(0.05)
-print("deadline" if t.is_alive() else box.get("v"))
-__import__("os").close(r)
-__import__("os").close(w)
+print("deadline" if t.is_alive() else box.get("v"), t.daemon)
+os.close(w)
 t.join(1)
+os.close(r)
+```
+
+```text output
+deadline True
+```
+
+## Closing the fd is what unblocks the thread
+
+Cancellation is cooperative. Setting an `Event` does nothing to a thread
+blocked in `os.read`, and nothing to a thread that never checks the flag.
+Close the resource, or the thread stays stuck until the process exits.
+
+```python file=n03.py
+import os
+import threading
+
+r, w = os.pipe()
+done = threading.Event()
+stop = threading.Event()
+
+
+def blocked():
+    os.read(r, 1)
+    done.set()
+
+
+t = threading.Thread(target=blocked, daemon=True)
+t.start()
+stop.set()
+t.join(0.05)
+print("still blocked", t.is_alive())
+os.close(w)
+t.join(1)
+print("unblocked", done.is_set())
+os.close(r)
+```
+
+```text output
+still blocked True
+unblocked True
+```
+
+## A full queue is backpressure
+
+`Queue(maxsize=n)` and `put_nowait` accept what fits and raise `queue.Full`
+after that. `put` with a timeout does the same once the wait expires.
+`put` with no timeout blocks the producer and hides the overflow. A full
+queue is the signal to slow down or reject.
+
+```python file=n04.py
+import queue
 
 q = queue.Queue(maxsize=2)
 accepted = 0
@@ -90,6 +162,26 @@ for i in range(5):
     except queue.Full:
         break
 print("accepted", accepted)
+try:
+    q.put("more", timeout=0.05)
+except queue.Full:
+    print("full")
+```
+
+```text output
+accepted 2
+full
+```
+
+## Stopping can leave the queued work behind
+
+These workers wait until the event is set and never read the queue.
+Dropping queued work is a choice. The other choice is to drain. Pick one
+and test it. Do not do neither.
+
+```python file=n05.py
+import queue
+import threading
 
 work = queue.Queue()
 for i in range(4):
@@ -97,9 +189,11 @@ for i in range(4):
 stop = threading.Event()
 started = threading.Barrier(3)
 
+
 def consume():
     started.wait()
     stop.wait()
+
 
 threads = [threading.Thread(target=consume) for _ in range(2)]
 for t in threads:
@@ -112,37 +206,8 @@ print("stopped", work.qsize())
 ```
 
 ```text output
-pool [0, 1, 4, 9] 2
-deadline
-accepted 2
 stopped 4
 ```
-
-## Details that bite
-
-- `max_in` is the number you have to be able to explain. If it climbs
-  past the worker count, the bound is not real: something started work
-  outside the pool.
-- `Queue(maxsize=n)` and `put_nowait` are backpressure. `put` with no
-  timeout hides the problem on a blocked producer thread. A full queue
-  is the signal to slow down or reject.
-- `Event.wait(timeout)` and `Thread.join(timeout)` are deadlines. A
-  150ms socket timeout inside a transfer that retries forever is not a
-  deadline for the operation.
-- Cancellation is cooperative. Setting an `Event` does nothing to a
-  thread blocked in `os.read` until you close the fd, and nothing to a
-  thread that never checks the flag. Close the resource, or the thread
-  is stuck until process exit.
-- A non-daemon thread keeps the interpreter alive. A timeout helper that
-  joins forever turns the deadline into a hang. Daemon threads die with
-  the process; they are for work you are willing to abandon.
-- The workers in the example wait until stop is signalled and leave the
-  queue untouched (`stopped 4`). Dropping queued work is a choice. The
-  other choice is to drain. Pick one and test it. Do not do neither.
-- `asyncio` has the same three knobs: a `Semaphore` for the in-flight
-  cap, `asyncio.timeout` for the deadline, and a bounded `Queue` for
-  backpressure. Threads are here because the blocking call is the
-  interesting case.
 
 ## Exercises
 

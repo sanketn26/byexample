@@ -1,13 +1,22 @@
 # Go 14 — Capstone: an LRU Cache
 
-A *least-recently-used* cache keeps the N most recently touched entries and
-evicts the stalest. It pulls together generics, structs and methods, maps,
-`container/list`, and zero-value/constructor design. (The same capstone is in
-every language of this course; compare how the data structure changes.)
+A least-recently-used cache keeps the N most recently touched entries and
+evicts the stalest. A map finds the node in O(1). A linked list orders it,
+front meaning most recent. A slice scan would be O(n) per call.
+`container/list` stores `any`, so every access type-asserts; that is the
+price of a non-generic standard list. A custom list of `*node[K, V]` is
+faster and avoids the assertion. Keys should be small and comparable:
+a large struct key is copied on every map operation. The cache is not
+goroutine-safe. `Get` mutates recency, so even a read needs the write
+lock. Use `sync.Mutex`, not `RWMutex`.
 
-## Example
+## The cache is a map plus a list
 
-```go file=example.go
+`Put` of a new key pushes a node to the front and records it in the map.
+`Keys` walks from the front, so the newest key is first. Capacity here is
+3, so nothing is evicted yet.
+
+```go file=n01.go
 package main
 
 import (
@@ -15,12 +24,10 @@ import (
 	"fmt"
 )
 
-// LRU is a fixed-capacity cache. Not safe for concurrent use: wrap it
-// with a sync.Mutex if goroutines share it.
 type LRU[K comparable, V any] struct {
 	cap   int
-	order *list.List          // front = most recently used
-	items map[K]*list.Element // key -> its node in order
+	order *list.List
+	items map[K]*list.Element
 }
 
 type entry[K comparable, V any] struct {
@@ -29,9 +36,6 @@ type entry[K comparable, V any] struct {
 }
 
 func NewLRU[K comparable, V any](capacity int) *LRU[K, V] {
-	if capacity <= 0 {
-		panic("lru: capacity must be positive")
-	}
 	return &LRU[K, V]{
 		cap:   capacity,
 		order: list.New(),
@@ -39,7 +43,61 @@ func NewLRU[K comparable, V any](capacity int) *LRU[K, V] {
 	}
 }
 
-// Get returns the value and marks it as most recently used.
+func (c *LRU[K, V]) Put(key K, val V) {
+	c.items[key] = c.order.PushFront(&entry[K, V]{key, val})
+}
+
+func (c *LRU[K, V]) Keys() []K {
+	keys := make([]K, 0, c.order.Len())
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		keys = append(keys, el.Value.(*entry[K, V]).key)
+	}
+	return keys
+}
+
+func main() {
+	c := NewLRU[string, int](3)
+	c.Put("a", 1)
+	c.Put("b", 2)
+	fmt.Println(c.Keys(), c.order.Len())
+}
+```
+
+```text output
+[b a] 2
+```
+
+## `Get` moves the hit to the front
+
+A hit type-asserts the node, moves it, and returns the value. A miss
+returns the zero value and false, and does not change the order.
+
+```go file=n02.go
+package main
+
+import (
+	"container/list"
+	"fmt"
+)
+
+type LRU[K comparable, V any] struct {
+	order *list.List
+	items map[K]*list.Element
+}
+
+type entry[K comparable, V any] struct {
+	key K
+	val V
+}
+
+func NewLRU[K comparable, V any]() *LRU[K, V] {
+	return &LRU[K, V]{order: list.New(), items: map[K]*list.Element{}}
+}
+
+func (c *LRU[K, V]) Put(key K, val V) {
+	c.items[key] = c.order.PushFront(&entry[K, V]{key, val})
+}
+
 func (c *LRU[K, V]) Get(key K) (V, bool) {
 	if el, ok := c.items[key]; ok {
 		c.order.MoveToFront(el)
@@ -49,7 +107,68 @@ func (c *LRU[K, V]) Get(key K) (V, bool) {
 	return zero, false
 }
 
-// Put inserts or updates, evicting the least recently used when full.
+func (c *LRU[K, V]) Keys() []K {
+	var keys []K
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		keys = append(keys, el.Value.(*entry[K, V]).key)
+	}
+	return keys
+}
+
+func main() {
+	c := NewLRU[string, int]()
+	c.Put("a", 1)
+	c.Put("b", 2)
+	v, ok := c.Get("a")
+	fmt.Println(v, ok, c.Keys())
+	v, ok = c.Get("missing")
+	fmt.Println(v, ok, c.Keys())
+}
+```
+
+```text output
+1 true [a b]
+0 false [a b]
+```
+
+## `Put` of a new key evicts the back
+
+When the list grows past capacity, the back node is the least recently
+used. `Get("a")` moved `a` to the front, so `b` is the one removed when
+`c` arrives.
+
+```go file=n03.go
+package main
+
+import (
+	"container/list"
+	"fmt"
+)
+
+type LRU[K comparable, V any] struct {
+	cap   int
+	order *list.List
+	items map[K]*list.Element
+}
+
+type entry[K comparable, V any] struct {
+	key K
+	val V
+}
+
+func NewLRU[K comparable, V any](capacity int) *LRU[K, V] {
+	return &LRU[K, V]{cap: capacity, order: list.New(), items: map[K]*list.Element{}}
+}
+
+func (c *LRU[K, V]) Get(key K) (V, bool) {
+	if el, ok := c.items[key]; ok {
+		c.order.MoveToFront(el)
+		return el.Value.(*entry[K, V]).val, true
+	}
+	var zero V
+	return zero, false
+}
+
 func (c *LRU[K, V]) Put(key K, val V) {
 	if el, ok := c.items[key]; ok {
 		el.Value.(*entry[K, V]).val = val
@@ -64,55 +183,131 @@ func (c *LRU[K, V]) Put(key K, val V) {
 	}
 }
 
-// Keys lists keys from most to least recently used.
 func (c *LRU[K, V]) Keys() []K {
-	keys := make([]K, 0, c.order.Len())
+	var keys []K
 	for el := c.order.Front(); el != nil; el = el.Next() {
 		keys = append(keys, el.Value.(*entry[K, V]).key)
 	}
 	return keys
 }
 
-func (c *LRU[K, V]) Len() int { return c.order.Len() }
+func main() {
+	c := NewLRU[string, int](2)
+	c.Put("a", 1)
+	c.Put("b", 2)
+	c.Get("a")
+	c.Put("c", 3)
+	v, ok := c.Get("b")
+	fmt.Println(v, ok)
+	fmt.Println(c.Keys(), c.order.Len())
+}
+```
+
+```text output
+0 false
+[c a] 2
+```
+
+## Updating a key does not grow the cache
+
+`Put` of a key that is already present overwrites the value and moves that
+node to the front. Length stays at capacity.
+
+```go file=n04.go
+package main
+
+import (
+	"container/list"
+	"fmt"
+)
+
+type LRU[K comparable, V any] struct {
+	cap   int
+	order *list.List
+	items map[K]*list.Element
+}
+
+type entry[K comparable, V any] struct {
+	key K
+	val V
+}
+
+func NewLRU[K comparable, V any](capacity int) *LRU[K, V] {
+	return &LRU[K, V]{cap: capacity, order: list.New(), items: map[K]*list.Element{}}
+}
+
+func (c *LRU[K, V]) Get(key K) (V, bool) {
+	el, ok := c.items[key]
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	c.order.MoveToFront(el)
+	return el.Value.(*entry[K, V]).val, true
+}
+
+func (c *LRU[K, V]) Put(key K, val V) {
+	if el, ok := c.items[key]; ok {
+		el.Value.(*entry[K, V]).val = val
+		c.order.MoveToFront(el)
+		return
+	}
+	c.items[key] = c.order.PushFront(&entry[K, V]{key, val})
+	if c.order.Len() > c.cap {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.items, oldest.Value.(*entry[K, V]).key)
+	}
+}
+
+func (c *LRU[K, V]) Keys() []K {
+	var keys []K
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		keys = append(keys, el.Value.(*entry[K, V]).key)
+	}
+	return keys
+}
 
 func main() {
 	c := NewLRU[string, int](2)
 	c.Put("a", 1)
 	c.Put("b", 2)
-	v, ok := c.Get("a") // a becomes the newest
-	fmt.Println(v, ok)
-	c.Put("c", 3) // evicts b
-	v, ok = c.Get("b")
-	fmt.Println(v, ok)
-	fmt.Println(c.Keys(), c.Len())
-
-	func() {
-		defer func() { fmt.Println("recovered:", recover()) }()
-		NewLRU[int, int](0)
-	}()
+	c.Put("a", 9)
+	v, ok := c.Get("a")
+	fmt.Println(v, ok, c.Keys(), c.order.Len())
 }
 ```
 
 ```text output
-1 true
-0 false
-[c a] 2
-recovered: lru: capacity must be positive
+9 true [a b] 2
 ```
 
-## Details that bite
+## A bad capacity is a programmer error
 
-- `container/list` stores `any`, so every access needs a type assertion;
-  that is the price of a non-generic standard list. A custom intrusive
-  list of `*node[K, V]` is faster and type-safe.
-- A map plus a linked list gives O(1) `Get` and `Put`. A slice scan would
-  be O(n) per operation.
-- The cache is *not* goroutine-safe: reads mutate recency, so even `Get`
-  needs the write lock. A `sync.Mutex` (not `RWMutex`) is correct.
-- Hold keys small and comparable; large struct keys are copied on every
-  map operation.
-- Panicking on invalid constructor arguments is reasonable for
-  programmer errors; return an error if the value comes from user input.
+`NewLRU(0)` panics. That is reasonable when the caller is another piece of
+the program. If the number comes from user input, return an error instead
+of panicking.
+
+```go file=n05.go
+package main
+
+import "fmt"
+
+func NewLRU[K comparable, V any](capacity int) {
+	if capacity <= 0 {
+		panic("lru: capacity must be positive")
+	}
+}
+
+func main() {
+	defer func() { fmt.Println("recovered:", recover()) }()
+	NewLRU[int, int](0)
+}
+```
+
+```text output
+recovered: lru: capacity must be positive
+```
 
 ## Exercises
 

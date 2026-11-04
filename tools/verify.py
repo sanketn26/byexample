@@ -3,8 +3,9 @@
 
 Fence conventions inside a lesson:
 
-    ```python file=example.py      -> written to <tmp>/example.py
-    ```text output                -> expected stdout of example.*
+    ```python file=n01.py         -> one concept; the next output block is its stdout
+    ```text output                -> expected stdout of the nugget just above
+    ```python file=example.py     -> older single-program shape; still accepted
     ```python file=exercise.py    -> starter code; must compile and must FAIL
     ```python file=solution.py    -> reference solution; must exit 0
 
@@ -60,22 +61,47 @@ def execute(lang, path: Path, tmp: Path):
     return run(sub(runner), tmp, lang), None
 
 
-def verify(md: Path) -> list[str]:
-    lang = md.parent.name
-    problems = []
-    files, expected = {}, None
-    for _lang, info, body in FENCE.findall(md.read_text()):
+# A nugget is one concept: file=n01.py, file=n02.py, ... in reading order.
+# file=example.* is the older single-program shape and still verifies.
+NUGGET = re.compile(r"^(example|n\d+)$")
+
+
+def parse_blocks(text: str):
+    """Return (files, nugget names in order, expected stdout per nugget, problems)."""
+    files, nuggets, expected, problems = {}, [], {}, []
+    pending = None
+    for _lang, info, body in FENCE.findall(text):
         m = re.search(r"file=(\S+)", info)
         if m:
-            files[m.group(1)] = body
+            name = m.group(1)
+            files[name] = body
+            if NUGGET.match(name.split(".")[0]):
+                if pending:
+                    problems.append(f"nugget {pending} has no ```text output block before {name}")
+                pending = name
+                nuggets.append(name)
         elif "output" in info.split():
-            expected = body
+            if pending is None:
+                problems.append("```text output block does not follow a nugget")
+            else:
+                expected[pending] = body
+                pending = None
+    if pending:
+        problems.append(f"nugget {pending} has no ```text output block")
+    return files, nuggets, expected, problems
+
+
+def verify(md: Path) -> list[str]:
+    lang = md.parent.name
+    files, nuggets, expected, problems = parse_blocks(md.read_text())
     kinds = {name.split(".")[0] for name in files}
-    missing = {"example", "exercise", "solution"} - kinds
-    if missing:
-        return [f"{md.name}: missing code block(s): {', '.join(sorted(missing))}"]
-    if expected is None:
-        return [f"{md.name}: missing ```text output block"]
+    if not nuggets:
+        problems.append(f"{md.name}: missing a nugget (file=n01.* or file=example.*)")
+    if not {"exercise", "solution"} <= kinds:
+        missing = {"exercise", "solution"} - kinds
+        problems.append(f"{md.name}: missing code block(s): {', '.join(sorted(missing))}")
+    if problems:
+        return [p if p.startswith(md.name) else f"{md.name}: {p}" for p in problems]
     for text in re.findall(r"\]\(([^)#]+\.md)\)", md.read_text()):
         if not (md.parent / text).exists():
             problems.append(f"{md.name}: broken link to {text}")
@@ -87,12 +113,12 @@ def verify(md: Path) -> list[str]:
         for name, body in files.items():
             (tmp / name).write_text(body)
         for name in sorted(files):
-            if name.split(".")[0] not in ("example", "exercise", "solution"):
+            kind = name.split(".")[0]
+            if not NUGGET.match(kind) and kind not in ("exercise", "solution"):
                 continue  # support file
             if lang in SUFFIX and not name.endswith(SUFFIX[lang]):
                 continue
             res, build_err = execute(lang, tmp / name, tmp)
-            kind = name.split(".")[0]
             if kind == "exercise":
                 if build_err:
                     problems.append(f"{md.name}: {name} does not compile:\n{build_err.stderr}")
@@ -103,10 +129,11 @@ def verify(md: Path) -> list[str]:
                 problems.append(f"{md.name}: {name} build failed:\n{build_err.stderr}")
             elif res.returncode != 0:
                 problems.append(f"{md.name}: {name} exit {res.returncode}\n{res.stdout}{res.stderr}")
-            elif kind == "example" and expected is not None:
-                if res.stdout.rstrip() != expected.rstrip():
+            elif NUGGET.match(kind):
+                want = expected.get(name, "")
+                if res.stdout.rstrip() != want.rstrip():
                     problems.append(
-                        f"{md.name}: {name} output mismatch\n--- expected\n{expected}\n--- got\n{res.stdout}")
+                        f"{md.name}: {name} output mismatch\n--- expected\n{want}\n--- got\n{res.stdout}")
     return problems
 
 

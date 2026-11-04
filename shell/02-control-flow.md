@@ -1,45 +1,203 @@
 # Shell 02 — Control Flow
 
-Shell branches on **exit status**, not on booleans. `if` runs a command;
-status `0` means "true". `[[ ... ]]` and `(( ... ))` are just commands that
+Shell branches on exit status, not on booleans. `if` runs a command.
+Status `0` means true. `[[ ... ]]` and `(( ... ))` are commands that
 return 0 or 1.
 
-## Example
+## `if` runs a command
 
-```bash file=example.sh
-#!/usr/bin/env bash
+There is no boolean type. The branch is taken when the command exits 0.
 
-# if tests a command's exit status
+```bash file=n01.sh
 if grep -q "needle" <<< "hay needle hay"; then echo "found"; fi
+```
 
-# [[ ]] is the bash test: strings, files, patterns, regex
+```text output
+found
+```
+
+## `[` splits words; `[[ ]]` does not
+
+`[` is a real command, so it needs spaces and a closing `]`. An empty
+or spaced value is a syntax error. Prefer `[[ ]]` in bash.
+
+```bash file=n02.sh
+x=""
+[ $x = y ] || true
+x="a b"
+[[ $x == "a b" ]] && echo "[[ ]] kept the spaces"
+```
+
+```text output
+n02.sh: line 2: [: =: unary operator expected
+[[ ]] kept the spaces
+```
+
+## `[[ ]]` tests strings, files, and patterns
+
+An unquoted right-hand side of `==` is a glob. Quote it (`"$pat"`) to
+compare literally. `=~` is a regex, and the capture lands in
+`BASH_REMATCH`. Keep a regex that contains spaces in a variable.
+
+```bash file=n03.sh
 f="report.txt"
-[[ $f == *.txt ]]            && echo "glob match"
-[[ $f =~ ^([a-z]+)\.txt$ ]]  && echo "regex group: ${BASH_REMATCH[1]}"
-[[ -z "" ]]                  && echo "empty string"
-[[ -d /tmp ]]                && echo "/tmp is a directory"
+[[ $f == *.txt ]] && echo "glob match"
+pat="*.txt"
+[[ $f == $pat ]] && echo "unquoted pat globs"
+[[ $f == "$pat" ]] || echo "quoted pat is literal"
+re='^([a-z]+)\.txt$'
+[[ $f =~ $re ]] && echo "regex group: ${BASH_REMATCH[1]}"
+[[ -z "" ]] && echo "empty string"
+[[ -d /tmp ]] && echo "/tmp is a directory"
 [[ -e /definitely/not/here ]] || echo "missing"
+```
 
-# (( )) is arithmetic; non-zero is true
+```text output
+glob match
+unquoted pat globs
+quoted pat is literal
+regex group: report
+empty string
+/tmp is a directory
+missing
+```
+
+## `(( ))` is true when the value is non-zero
+
+The test is arithmetic. A remainder of 1 is true, so odd numbers pass.
+
+```bash file=n04.sh
 n=7
 if (( n % 2 )); then echo "$n is odd"; fi
+```
 
-# && and || chain on status; the last status wins
+```text output
+7 is odd
+```
+
+## `(( count++ ))` fails when the old value is 0
+
+The status is the value before the increment. Under `set -e` that exits
+the script. `(( ++count ))` or `count=$((count + 1))` stays safe.
+
+```bash file=n05.sh
+bash -c 'set -e; count=0; (( count++ )); echo survived' || echo "post-increment aborted"
+bash -c 'set -e; count=0; (( ++count )); echo "pre-increment survived"'
+```
+
+```text output
+post-increment aborted
+pre-increment survived
+```
+
+## `a && b || c` is not if/then/else
+
+`&&` and `||` chain on status, and the last status wins. If `b` fails,
+`c` runs too. Use a real `if` when the middle command can fail.
+
+```bash file=n06.sh
 true && echo "and-then" || echo "never"
 false || echo "or-else"
+echo middle && false || echo "also ran"
+```
 
-# for over words, globs, ranges and C-style
-for color in red green blue; do printf '%s ' "$color"; done; echo
-for i in {1..5}; do printf '%d ' "$i"; done; echo
-for ((i = 10; i > 0; i -= 4)); do printf '%d ' "$i"; done; echo
+```text output
+and-then
+or-else
+middle
+also ran
+```
 
-# while read: the idiom for lines (-r keeps backslashes, IFS= keeps spaces)
+## `for` walks words, ranges, and arithmetic
+
+Brace expansion (`{1..5}`) happens before the loop. The C-style form
+is arithmetic, like `(( ))`.
+
+```bash file=n07.sh
+for color in red green blue; do printf '%s ' "$color"; done
+echo
+for i in {1..5}; do printf '%d ' "$i"; done
+echo
+for ((i = 10; i > 0; i -= 4)); do printf '%d ' "$i"; done
+echo
+```
+
+```text output
+red green blue 
+1 2 3 4 5 
+10 6 2 
+```
+
+## An unmatched glob is left as text
+
+`for f in *.txt` runs once with the literal `*.txt` when nothing
+matches. `shopt -s nullglob` makes it run zero times. `for f in $(ls)`
+splits on spaces. Use the glob.
+
+```bash file=n08.sh
+tmp=$(mktemp -d)
+cd "$tmp"
+touch "my notes.txt"
+for f in *.txt; do printf 'match <%s>\n' "$f"; done
+for f in *.md; do printf 'miss <%s>\n' "$f"; done
+shopt -s nullglob
+for f in *.md; do printf 'null <%s>\n' "$f"; done
+echo "nullglob done"
+for f in $(ls); do printf 'ls <%s>\n' "$f"; done
+```
+
+```text output
+match <my notes.txt>
+miss <*.md>
+nullglob done
+ls <my>
+ls <notes.txt>
+```
+
+## `while IFS= read -r` keeps the line
+
+`-r` keeps backslashes. An empty `IFS` keeps leading spaces. The
+here-doc is quoted (`<<'EOF'`) so the body is not expanded.
+
+```bash file=n09.sh
 while IFS= read -r line; do echo "[$line]"; done <<'EOF_DATA'
   indented
 two words
 EOF_DATA
+```
 
-# case matches glob patterns; ;; ends a branch
+```text output
+[  indented]
+[two words]
+```
+
+## A pipe runs `while read` in a subshell
+
+Variables set in that loop disappear. Feed the loop with `< file` or
+`<<< "$var"` instead. Lesson 08 shows the same rule for pipelines.
+
+```bash file=n10.sh
+n=0
+printf 'a\nb\n' | while read -r _; do n=$((n + 1)); done
+echo "pipe n=$n"
+n=0
+while read -r _; do n=$((n + 1)); done <<'EOF'
+a
+b
+EOF
+echo "redirect n=$n"
+```
+
+```text output
+pipe n=0
+redirect n=2
+```
+
+## `case` matches glob patterns
+
+`;;` ends a branch. The first match wins. `*` is the default.
+
+```bash file=n11.sh
 kind() {
   case "$1" in
     *.tar.gz|*.tgz) echo "tarball" ;;
@@ -48,64 +206,51 @@ kind() {
     *)              echo "unknown" ;;
   esac
 }
-kind a.tgz; kind notes.md; kind 7up; kind zzz
+kind a.tgz
+kind notes.md
+kind 7up
+kind zzz
+```
 
-# break / continue, and until
+```text output
+tarball
+markdown
+starts with digit
+unknown
+```
+
+## `until` stops when the test succeeds
+
+`continue` skips the rest of the body. `break` leaves the loop. Use
+`(( ++count ))` so a zero start does not look like a failure.
+
+```bash file=n12.sh
 count=0
 until (( count >= 3 )); do
   (( ++count ))
   (( count == 2 )) && continue
   echo "count=$count"
 done
+```
 
-# select a sum with a loop; (( )) assigns too
+```text output
+count=1
+count=3
+```
+
+## `(( ))` assigns as well as tests
+
+The same arithmetic context that `if` tests can update a variable.
+
+```bash file=n13.sh
 total=0
 for n in 1 2 3 4; do (( total += n )); done
 echo "total=$total"
 ```
 
 ```text output
-found
-glob match
-regex group: report
-empty string
-/tmp is a directory
-missing
-7 is odd
-and-then
-or-else
-red green blue 
-1 2 3 4 5 
-10 6 2 
-[  indented]
-[two words]
-tarball
-markdown
-starts with digit
-unknown
-count=1
-count=3
 total=10
 ```
-
-## Details that bite
-
-- `if [ $x = y ]` with `x` empty or containing spaces is a syntax error.
-  `[[ ]]` does not word-split, so prefer it in bash. (`[` is a real command,
-  which is why it needs the closing `]` and spaces.)
-- `a && b || c` is **not** if/then/else: if `b` fails, `c` also runs. Use a
-  real `if` when `b` can fail.
-- In `[[ $x == pat ]]` an *unquoted* right side is a glob pattern; quote it
-  (`"$pat"`) to compare literally. For `=~` keep the regex in a variable
-  instead of inline when it contains spaces.
-- `(( count++ ))` returns status 1 when the old value is 0, which kills a
-  script under `set -e` (lesson 07). `(( ++count ))` or `count=$((count+1))`
-  are safe.
-- `for f in $(ls)` splits on spaces and breaks on odd names. Use a glob:
-  `for f in *.txt`. If nothing matches, the loop runs once with the
-  literal `*.txt` unless you `shopt -s nullglob`.
-- A `while read` fed by a pipe runs in a subshell, so variables set inside
-  vanish (lesson 08). Feed it with `< file` or `<<< "$var"` instead.
 
 ## Exercises
 

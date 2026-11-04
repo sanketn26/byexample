@@ -1,24 +1,36 @@
 # Go 12 — Idiomatic Go
 
-Go is deliberately small. "Idiomatic" mostly means: *do the plain thing, make
-the zero value useful, keep the happy path left-aligned, and let the
-standard library's conventions guide you.*
+Go is deliberately small. Do the plain thing, make the zero value useful,
+and keep the happy path left-aligned. `gofmt` settles formatting, so do not
+argue about it. Names are `MixedCaps`, short in a short scope (`i`, `r`,
+`buf`), never `snake_case` and never `GetFoo` when `Foo` will do. Packages
+are short, lowercase, and singular (`bytes`, not `util`, `common`, or
+`helpers`). Receivers are one or two letters, consistent, and never `this`
+or `self`. A comment starts with the name: `// Foo does …`.
+`context.Context` is the first parameter and is not stored in a struct.
+Put code that must stay private in `internal/`. Avoid `init` and mutable
+package globals. Return errors, wrapped with `%w`, instead of panicking for
+control flow. Reach for `strings.Builder` and `make([]T, 0, n)` instead of
+repeated `+=`. A little copying beats a little dependency, and a little
+repetition beats a premature abstraction. If a generic seems necessary,
+check whether an interface or a plain function already does the job. Run
+`go vet ./...`, `staticcheck ./...`, and `go test -race ./...` in CI. The
+standard library (`bufio`, `net/http`, `sort`, `io`) is the style guide.
+Do not rebuild Java: no getters, no `AbstractFactoryBean`, no inheritance
+tree. Handle an error where you have enough context to do something useful.
+Concurrency needs a way to stop; do not fire a goroutine and forget it.
 
-## Example
+## An enum is `iota` plus `String`
 
-```go file=example.go
+The zero value is the first name. `String` is what `%v` prints; `%d` is
+still the number. An unknown value should show the number rather than a
+blank.
+
+```go file=n01.go
 package main
 
-import (
-	"fmt"
-	"io"
-	"os"
-	"strings"
-	"sync"
-	"time"
-)
+import "fmt"
 
-// 1. Enums: a named type + iota + String().
 type Weekday int
 
 const (
@@ -39,8 +51,31 @@ func (d Weekday) String() string {
 	return fmt.Sprintf("Weekday(%d)", int(d))
 }
 
-// 2. Functional options: optional configuration without constructor
-// explosions or config structs full of zero values.
+func main() {
+	fmt.Println(Monday, Weekday(9))
+	fmt.Printf("%v %d\n", Tuesday, Tuesday)
+}
+```
+
+```text output
+Monday Weekday(9)
+Tuesday 2
+```
+
+## Options are functions that edit a struct
+
+Defaults live in the constructor. Each option is a `func(*Server)` the
+caller may pass or skip. That stays smaller than a constructor per
+combination, and it does not force the caller to fill a struct of zeros.
+
+```go file=n02.go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
 type Server struct {
 	host    string
 	port    int
@@ -49,21 +84,46 @@ type Server struct {
 
 type Option func(*Server)
 
-func WithPort(p int) Option               { return func(s *Server) { s.port = p } }
-func WithTimeout(d time.Duration) Option { return func(s *Server) { s.timeout = d } }
+func WithPort(p int) Option { return func(s *Server) { s.port = p } }
+
+func WithTimeout(d time.Duration) Option {
+	return func(s *Server) { s.timeout = d }
+}
 
 func NewServer(host string, opts ...Option) *Server {
-	s := &Server{host: host, port: 8080, timeout: 30 * time.Second} // defaults
+	s := &Server{host: host, port: 8080, timeout: 30 * time.Second}
 	for _, o := range opts {
 		o(s)
 	}
 	return s
 }
 
-// 3. Make the zero value useful: no constructor needed.
+func main() {
+	s := NewServer("localhost", WithPort(9000))
+	fmt.Println(s.host, s.port, s.timeout)
+}
+```
+
+```text output
+localhost 9000 30s
+```
+
+## The zero value should be ready to use
+
+`SafeSet` allocates its map on the first `Add`. Callers do not need a
+constructor, and the mutex is not copied because methods take a pointer.
+
+```go file=n03.go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
 type SafeSet struct {
 	mu sync.Mutex
-	m  map[string]struct{} // created lazily
+	m  map[string]struct{}
 }
 
 func (s *SafeSet) Add(k string) {
@@ -81,14 +141,67 @@ func (s *SafeSet) Len() int {
 	return len(s.m)
 }
 
-// 4. Accept interfaces, return concrete types. Inject io.Writer, not os.Stdout.
+func main() {
+	var set SafeSet
+	set.Add("a")
+	set.Add("a")
+	set.Add("b")
+	fmt.Println(set.Len())
+}
+```
+
+```text output
+2
+```
+
+## Accept an interface, return a concrete type
+
+`Report` writes to an `io.Writer`. The caller passes `os.Stdout` or a
+`strings.Builder`. The function returns nothing abstract: the concrete
+result is the bytes it wrote. Small interfaces belong next to the code
+that uses them, not next to one implementation.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
 func Report(w io.Writer, items []string) {
 	for i, it := range items {
 		fmt.Fprintf(w, "%d. %s\n", i+1, it)
 	}
 }
 
-// 5. Early returns keep the happy path unindented.
+func main() {
+	Report(os.Stdout, []string{"first", "second"})
+	var sb strings.Builder
+	Report(&sb, []string{"x"})
+	fmt.Printf("%q\n", sb.String())
+}
+```
+
+```text output
+1. first
+2. second
+"1. x\n"
+```
+
+## Return early and keep the happy path left
+
+The error checks leave the function. The success path is not nested inside
+`else`. The error text says what failed, in lowercase, with no trailing
+period.
+
+```go file=n05.go
+package main
+
+import "fmt"
+
 func parseAge(s string) (int, error) {
 	if s == "" {
 		return 0, fmt.Errorf("age: empty")
@@ -103,8 +216,48 @@ func parseAge(s string) (int, error) {
 	return n, nil
 }
 
-// 6. Table-driven tests: the idiomatic shape of Go tests, runnable here.
-func runTable() {
+func main() {
+	n, err := parseAge("42")
+	fmt.Println(n, err)
+	_, err = parseAge("")
+	fmt.Println(err)
+	_, err = parseAge("4x")
+	fmt.Println(err)
+}
+```
+
+```text output
+42 <nil>
+age: empty
+age: bad digit 'x'
+```
+
+## One table drives every case
+
+Each row names the input, the wanted value, and whether an error is
+expected. The loop is the whole test. Adding a case is a new row, not a
+copy of the body. With `go test`, the same loop calls `t.Run`.
+
+```go file=n06.go
+package main
+
+import "fmt"
+
+func parseAge(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("age: empty")
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("age: bad digit %q", r)
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, nil
+}
+
+func main() {
 	tests := []struct {
 		name    string
 		in      string
@@ -121,83 +274,203 @@ func runTable() {
 		fmt.Printf("%-8s pass=%v\n", tc.name, pass)
 	}
 }
+```
+
+```text output
+ok       pass=true
+empty    pass=true
+letters  pass=true
+```
+
+## Comma-ok and keyed literals survive change
+
+The boolean distinguishes a missing key from a stored zero. A keyed struct
+literal still compiles if someone reorders the fields; a positional one
+may not.
+
+```go file=n07.go
+package main
+
+import "fmt"
+
+type Server struct {
+	host string
+	port int
+}
 
 func main() {
-	fmt.Println(Monday, Weekday(9))
-	fmt.Printf("%v %d\n", Tuesday, Tuesday)
-
-	s := NewServer("localhost", WithPort(9000))
-	fmt.Println(s.host, s.port, s.timeout)
-
-	var set SafeSet // ready to use
-	set.Add("a")
-	set.Add("a")
-	set.Add("b")
-	fmt.Println(set.Len())
-
-	Report(os.Stdout, []string{"first", "second"})
-	var sb strings.Builder
-	Report(&sb, []string{"x"})
-	fmt.Printf("%q\n", sb.String())
-
-	runTable()
-
-	// 7. The comma-ok idiom and keyed struct literals
 	m := map[string]int{"a": 1}
 	if v, ok := m["b"]; !ok {
 		fmt.Println("missing b", v)
 	}
-	srv := Server{host: "h", port: 1} // keyed: survives field reordering
+	srv := Server{host: "h", port: 1}
 	fmt.Println(srv.port)
 }
 ```
 
 ```text output
-Monday Weekday(9)
-Tuesday 2
-localhost 9000 30s
-2
-1. first
-2. second
-"1. x\n"
-ok       pass=true
-empty    pass=true
-letters  pass=true
 missing b 0
 1
 ```
 
-## The checklist
+## `Atoi` reports a bad number
 
-| Do | Avoid |
-|----|-------|
-| `gofmt` / `go vet` on every save | arguing about formatting |
-| Short names for short scopes (`i`, `r`, `buf`) | `theCurrentIndexCounter` |
-| `MixedCaps`, no underscores | `snake_case`, `GetFoo()` (write `Foo()`) |
-| Package names: short, lowercase, singular (`bytes`) | `util`, `common`, `helpers` |
-| Receiver names of 1–2 letters, consistent | `this`, `self` |
-| Return errors, wrap with `%w` and context | panics for control flow |
-| `context.Context` as the **first** parameter | storing contexts in structs |
-| Small interfaces at the consumer | big interfaces next to the implementation |
-| `strings.Builder`, preallocate with `make([]T, 0, n)` | repeated `+=` |
-| Table-driven tests, `t.Run` subtests | copy-pasted test bodies |
-| Concurrency only when needed; always a way to stop | fire-and-forget goroutines |
-| Comments that start with the name: `// Foo does …` | comments that restate the code |
-| `internal/` packages to limit API surface | exporting everything |
-| Avoid `init()` and mutable package globals | hidden dependencies |
+`strconv.Atoi` returns the integer and an error. A bad string is an
+error, not a zero you have to second-guess.
 
-## Details that bite
+```go file=n08.go
+package main
 
-- Don't "fix" Go into another language: no getters/setters, no
-  `AbstractFactoryBean`, no inheritance hierarchies.
-- A little copying is better than a little dependency, and a little
-  repetition is better than a premature abstraction.
-- Handle errors where you have the context to do something useful.
-- If you need generics, check whether an interface or a plain function
-  already does the job.
-- Run `go vet ./...`, `staticcheck ./...` and `go test -race ./...` in CI.
-- Read the standard library: `bufio`, `net/http`, `sort`, `io`. It is the
-  best style guide there is.
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	n, err := strconv.Atoi("42")
+	fmt.Println(n, err == nil)
+	_, err = strconv.Atoi("no")
+	fmt.Println(err != nil)
+}
+```
+
+```text output
+42 true
+true
+```
+
+## `slices` searches and sorts
+
+`slices.Contains` answers membership. `slices.SortFunc` sorts in place.
+The comparison returns a negative number, zero, or a positive number.
+
+```go file=n09.go
+package main
+
+import (
+	"fmt"
+	"slices"
+)
+
+func main() {
+	xs := []int{3, 1, 2}
+	fmt.Println(slices.Contains(xs, 2), slices.Contains(xs, 9))
+	slices.SortFunc(xs, func(a, b int) int { return a - b })
+	fmt.Println(xs)
+}
+```
+
+```text output
+true false
+[1 2 3]
+```
+
+## `Cut` splits once
+
+`strings.Cut` returns the text before the separator, the text after it,
+and whether the separator was there. The host and the port of
+`host:port` are that one call.
+
+```go file=n10.go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	host, port, ok := strings.Cut("localhost:8080", ":")
+	fmt.Println(host, port, ok)
+	_, _, ok = strings.Cut("noport", ":")
+	fmt.Println(ok)
+}
+```
+
+```text output
+localhost 8080 true
+false
+```
+
+## `LookupEnv` tells you the name was unset
+
+An empty value and a missing name are different. The boolean is false
+only when the name is absent.
+
+```go file=n11.go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	os.Setenv("APP_PORT", "8080")
+	port, ok := os.LookupEnv("APP_PORT")
+	_, missing := os.LookupEnv("APP_MISSING")
+	fmt.Println(port, ok, missing)
+}
+```
+
+```text output
+8080 true false
+```
+
+## Marshal a struct with the field names you choose
+
+The `json` tag is the name in the document. `Marshal` returns bytes and
+an error.
+
+```go file=n12.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+func main() {
+	b, err := json.Marshal(struct {
+		Name string `json:"name"`
+		N    int    `json:"n"`
+	}{"Ada", 3})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(b))
+}
+```
+
+```text output
+{"name":"Ada","n":3}
+```
+
+## Parse a timestamp in RFC3339
+
+The layout string is the reference time `2006-01-02T15:04:05Z07:00`,
+not a strftime pattern. `time.RFC3339` is that layout.
+
+```go file=n13.go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	t, err := time.Parse(time.RFC3339, "2024-03-15T13:45:00Z")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(t.Format("2006-01-02"), t.UTC().Hour())
+}
+```
+
+```text output
+2024-03-15 13
+```
 
 ## Exercises
 

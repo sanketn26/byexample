@@ -1,66 +1,31 @@
 # Go 05 — Strings, Bytes and Runes
 
-A Go `string` is an immutable sequence of **bytes**, conventionally UTF-8.
-A `rune` is one Unicode code point (`int32`). Mixing those up is the main
-source of string bugs.
+A Go `string` is an immutable sequence of bytes, conventionally UTF-8. A
+`rune` is one Unicode code point (`int32`). Mixing those up is the main
+source of string bugs. `strings.Title` is deprecated and wrong for Unicode;
+use `golang.org/x/text/cases` when you need real title case.
 
-## Example
+## `len` counts bytes, not runes
 
-```go file=example.go
+Indexing a string yields a byte. The two-byte character `é` is why the
+byte length and the rune count disagree, and why `s[1:3]` is that whole
+character.
+
+```go file=n01.go
 package main
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 	"unicode/utf8"
 )
 
 func main() {
 	s := "héllo, 世界"
-	fmt.Println(len(s), utf8.RuneCountInString(s)) // bytes vs runes
-	fmt.Println(s[0], string(s[0]), s[1:3])        // indexing yields bytes
+	fmt.Println(len(s), utf8.RuneCountInString(s))
+	fmt.Println(s[0], string(s[0]), s[1:3])
 
-	r := []rune(s) // decode into code points
+	r := []rune(s)
 	fmt.Println(len(r), string(r[7:]))
-
-	bs := []byte("abc") // strings are immutable; bytes are not
-	bs[0] = 'X'
-	fmt.Println(string(bs))
-
-	// strings package
-	fmt.Println(strings.Contains("seafood", "foo"), strings.Index("chicken", "ken"),
-		strings.Split("a,b,c", ","), strings.Fields("  a  b "), strings.TrimSpace("  x "))
-	fmt.Println(strings.ToUpper("hello"), strings.Repeat("ab", 3), strings.ReplaceAll("hello", "e", "-"))
-
-	// Build with strings.Builder, not +=
-	var sb strings.Builder
-	for i := 0; i < 3; i++ {
-		fmt.Fprintf(&sb, "%d,", i)
-	}
-	fmt.Println(strings.TrimSuffix(sb.String(), ","))
-
-	// strconv: conversions return errors
-	n, err := strconv.Atoi("42")
-	fmt.Println(n, err)
-	n, err = strconv.Atoi("x")
-	fmt.Println(n, err)
-	f, _ := strconv.ParseFloat("3.5", 64)
-	b, _ := strconv.ParseBool("true")
-	fmt.Println(strconv.FormatInt(255, 2), strconv.Quote("hi\n"), f, b)
-
-	// Cut is the modern split-in-two
-	key, val, ok := strings.Cut("key=value", "=")
-	fmt.Println(key, val, ok)
-
-	fmt.Println(strings.EqualFold("Go", "GO"))
-
-	// Invalid UTF-8 decodes to U+FFFD
-	bad := "a\xffb"
-	fmt.Println([]rune(bad), utf8.ValidString(bad))
-
-	// Raw string literals do not process escapes
-	fmt.Println(len(`\n`), len("\n"))
 }
 ```
 
@@ -68,33 +33,256 @@ func main() {
 14 9
 104 h é
 9 世界
+```
+
+## `range` decodes runes; an index walks bytes
+
+`for i, r := range s` steps by code points. `for i := 0; i < len(s); i++`
+steps by bytes, including the continuation byte inside `é`.
+
+```go file=n02.go
+package main
+
+import "fmt"
+
+func main() {
+	s := "héy"
+	for i := 0; i < len(s); i++ {
+		fmt.Print(i, " ")
+	}
+	fmt.Println()
+	for i, r := range s {
+		fmt.Print(i, ":", string(r), " ")
+	}
+	fmt.Println()
+}
+```
+
+```text output
+0 1 2 3 
+0:h 1:é 3:y 
+```
+
+## Bytes are mutable; strings are not
+
+Converting to `[]byte` copies the data. You can then overwrite a byte and
+convert back. Strings are comparable and legal as map keys; `[]byte` is
+neither.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
+func main() {
+	bs := []byte("abc")
+	bs[0] = 'X'
+	fmt.Println(string(bs))
+	fmt.Println("go" == "go", map[string]int{"go": 1}["go"])
+}
+```
+
+```text output
 Xbc
+true 1
+```
+
+## The strings helpers search, split, and fold
+
+`Fields` splits on whitespace and drops the empty pieces. `TrimSpace`
+cuts only the ends. `EqualFold` ignores ASCII case. `ReplaceAll` replaces
+every match, not just the first.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	fmt.Println(strings.Contains("seafood", "foo"), strings.Index("chicken", "ken"),
+		strings.Split("a,b,c", ","), strings.Fields("  a  b "), strings.TrimSpace("  x "))
+	fmt.Println(strings.ToUpper("hello"), strings.Repeat("ab", 3), strings.ReplaceAll("hello", "e", "-"))
+	fmt.Println(strings.EqualFold("Go", "GO"))
+}
+```
+
+```text output
 true 4 [a b c] [a b] x
 HELLO ababab h-llo
+true
+```
+
+## Build a string with a Builder
+
+`s += x` in a loop allocates a new string every time. `strings.Builder`
+appends into one buffer. `TrimSuffix` drops a trailing separator you added
+on every iteration.
+
+```go file=n05.go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	var sb strings.Builder
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(&sb, "%d,", i)
+	}
+	fmt.Println(strings.TrimSuffix(sb.String(), ","))
+}
+```
+
+```text output
 0,1,2
+```
+
+## `strconv` converts and returns an error
+
+`Atoi` fails on input that is not an integer. Format functions never fail:
+base 2, quoted Go syntax, and the parsed float and bool are ordinary
+values.
+
+```go file=n06.go
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	n, err := strconv.Atoi("42")
+	fmt.Println(n, err)
+	n, err = strconv.Atoi("x")
+	fmt.Println(n, err)
+	f, _ := strconv.ParseFloat("3.5", 64)
+	b, _ := strconv.ParseBool("true")
+	fmt.Println(strconv.FormatInt(255, 2), strconv.Quote("hi\n"), f, b)
+}
+```
+
+```text output
 42 <nil>
 0 strconv.Atoi: parsing "x": invalid syntax
 11111111 "hi\n" 3.5 true
+```
+
+## `string(n)` converts a rune, not digits
+
+`string(65)` is `"A"`. The digits are `strconv.Itoa`. `go vet` flags
+`string` applied to a non-constant integer.
+
+```go file=n07.go
+package main
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func main() {
+	n := 65
+	fmt.Println(string(n), strconv.Itoa(n))
+}
+```
+
+```text output
+A 65
+```
+
+## `Cut` splits on the first separator
+
+The third result reports whether the separator was there. Use it instead
+of `SplitN` when a key and a value are the whole string.
+
+```go file=n08.go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+func main() {
+	key, val, ok := strings.Cut("key=value", "=")
+	fmt.Println(key, val, ok)
+}
+```
+
+```text output
 key value true
-true
+```
+
+## Invalid UTF-8 becomes U+FFFD
+
+Converting a broken string to `[]rune` replaces each bad byte with
+`65533`. `utf8.ValidString` is the check that does not hide the damage.
+
+```go file=n09.go
+package main
+
+import (
+	"fmt"
+	"unicode/utf8"
+)
+
+func main() {
+	bad := "a\xffb"
+	fmt.Println([]rune(bad), utf8.ValidString(bad))
+}
+```
+
+```text output
 [97 65533 98] false
+```
+
+## A raw literal does not process escapes
+
+Backticks keep the backslash and the `n` as two characters. A normal
+literal turns `\n` into one newline.
+
+```go file=n10.go
+package main
+
+import "fmt"
+
+func main() {
+	fmt.Println(len(`\n`), len("\n"))
+}
+```
+
+```text output
 2 1
 ```
 
-## Details that bite
+## Slicing mid-rune is allowed
 
-- `len(s)` is a **byte** count. `s[i]` is a byte, not a character.
-- `for i, r := range s` decodes runes; `for i := 0; i < len(s); i++` walks
-  bytes.
-- `s += x` in a loop allocates every time; use `strings.Builder` (or
-  `bytes.Buffer`).
-- `string(65)` is `"A"` (a rune conversion), not `"65"`; use `strconv.Itoa`.
-  `go vet` flags the mistake.
-- Strings are comparable and usable as map keys; `[]byte` is not.
-- `strings.Title` is deprecated and wrong for Unicode; use
-  `golang.org/x/text/cases` when you need proper title-casing.
-- Slicing a string at a non-rune boundary yields invalid UTF-8 without
-  complaint.
+Go will not stop you from cutting a code point in half. The result is
+invalid UTF-8. `%q` shows the raw byte; the string is not a character.
+
+```go file=n11.go
+package main
+
+import (
+	"fmt"
+	"unicode/utf8"
+)
+
+func main() {
+	s := "héllo"
+	fmt.Printf("%q %v\n", s[1:2], utf8.ValidString(s[1:2]))
+}
+```
+
+```text output
+"\xc3" false
+```
 
 ## Exercises
 

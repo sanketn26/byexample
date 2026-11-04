@@ -1,47 +1,121 @@
 # C 05 — Strings
 
 A C string is a `char` array ending in a `'\0'` byte. There is no string
-type, no length field, and no bounds checking — every string bug is a
-memory bug.
+type, no length field, and no bounds checking. Every string bug is a
+memory bug. Allocate `strlen(s) + 1` bytes so the terminator has room.
+`strlen` walks the whole string; do not call it in a loop condition.
+Strings are bytes: `strlen` on UTF-8 is a byte count, not a character
+count.
 
-## Example
+## You own an array; a literal is read-only
 
-```c file=example.c
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
+The array `buf` can be changed. A string literal must stay `const char *`.
+`char *p = "x"; p[0] = 'y';` is undefined.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+
+int main(void) {
+    char buf[16] = "hello";
+    printf("%zu %zu\n", sizeof buf, strlen(buf));
+    buf[0] = 'J';
+    const char *lit = "world";
+    printf("%s %s\n", buf, lit);
+    return 0;
+}
+```
+
+```text output
+16 5
+Jello world
+```
+
+## strcmp compares contents, not addresses
+
+The return is negative, zero, or positive. Only the sign is portable.
+`==` on two `char *` values compares addresses. Two arrays with the same
+characters are not the same pointer.
+
+```c file=n02.c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    printf("%d %d %d\n", strcmp("a", "b") < 0, strcmp("b", "b") == 0,
+           strcmp("c", "b") > 0);
+    char a[] = "hi", b[] = "hi";
+    const char *pa = a, *pb = b;
+    printf("%d %d\n", pa == pb, strcmp(a, b) == 0);
+    return 0;
+}
+```
+
+```text output
+1 1 1
+0 1
+```
+
+## snprintf never writes past the buffer
+
+It terminates when `cap > 0` and returns the length it *wanted*, which
+can be longer than what fits. Do not use `gets` (removed in C11),
+`strcpy`, `strcat`, or `sprintf` on data you do not fully control.
+`strncpy` is not a safe `strcpy`: it can leave out the terminator and it
+pads with zeros.
+
+```c file=n03.c
+#include <stddef.h>
+#include <stdio.h>
 
 static int format_id(char *out, size_t cap, const char *name, int id) {
     return snprintf(out, cap, "%s-%d", name, id);
 }
 
 int main(void) {
-    /* An array you own and may modify */
-    char buf[16] = "hello";
-    printf("%zu %zu\n", sizeof buf, strlen(buf));
-    buf[0] = 'J';
-
-    /* A pointer to a literal: read-only, so keep it const */
-    const char *lit = "world";
-    printf("%s %s\n", buf, lit);
-
-    /* strcmp returns <0, 0, >0 (only the sign is portable) */
-    printf("%d %d %d\n", strcmp("a", "b") < 0, strcmp("b", "b") == 0,
-           strcmp("c", "b") > 0);
-
-    /* snprintf never overflows and returns the length it WANTED */
     char out[8];
     int need = format_id(out, sizeof out, "abcdef", 12345);
     printf("%d [%s]\n", need, out);
+    return 0;
+}
+```
 
-    /* Searching */
+```text output
+12 [abcdef-]
+```
+
+## strchr and strstr return pointers into the same string
+
+`strrchr` finds the last slash, so one past it is the final component.
+`strstr` finds the first match of a substring.
+
+```c file=n04.c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
     const char *path = "/usr/local/bin";
     printf("%s %s\n", strrchr(path, '/') + 1, strstr(path, "local"));
+    return 0;
+}
+```
 
-    /* strtol: the correct way to parse numbers */
+```text output
+bin local/bin
+```
+
+## strtol can fail; atoi cannot
+
+`end` points at the first unconverted byte. Set `errno = 0` first: a
+successful call is allowed to leave a stale `errno`, and overflow sets
+`ERANGE`. `atoi` has no way to report either failure.
+
+```c file=n05.c
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
     char *end;
     errno = 0;
     long v = strtol("123abc", &end, 10);
@@ -49,8 +123,27 @@ int main(void) {
     errno = 0;
     strtol("99999999999999999999", NULL, 10);
     printf("%d\n", errno == ERANGE);
+    return 0;
+}
+```
 
-    /* Splitting by hand with strchr (strtok mutates and is not reentrant) */
+```text output
+123 [abc] 0
+1
+```
+
+## Split without strtok
+
+`strtok` writes NULs into the string and keeps state, so it is not
+reentrant. `strchr` plus a length prints one field and leaves the source
+alone.
+
+```c file=n06.c
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
     const char *csv = "a,bb,ccc";
     const char *start = csv;
     for (;;) {
@@ -63,20 +156,69 @@ int main(void) {
         start = comma + 1;
     }
     printf("\n");
+    return 0;
+}
+```
 
-    /* ctype functions take unsigned char values */
+```text output
+a|bb|ccc|
+```
+
+## ctype wants an unsigned char value
+
+`char` may be signed. Passing a negative character to `toupper` or
+`isalpha` is undefined. Cast to `unsigned char` first.
+
+```c file=n07.c
+#include <ctype.h>
+#include <stddef.h>
+#include <stdio.h>
+
+int main(void) {
     char word[] = "mixed Case";
     for (size_t i = 0; word[i] != '\0'; i++) {
         word[i] = (char)toupper((unsigned char)word[i]);
     }
     printf("%s\n", word);
+    return 0;
+}
+```
 
-    /* sscanf returns the number of items converted */
+```text output
+MIXED CASE
+```
+
+## sscanf returns how many conversions worked
+
+Two items match `"12:34"`. A shorter or different string returns fewer,
+and the unwritten outputs stay unchanged. Never pass user-controlled text
+as a `printf` format string: use `printf("%s", s)`, not `printf(s)`.
+
+```c file=n08.c
+#include <stdio.h>
+
+int main(void) {
     int h, m;
     int n = sscanf("12:34", "%d:%d", &h, &m);
     printf("%d %d %d\n", n, h, m);
+    return 0;
+}
+```
 
-    /* memmove handles overlapping ranges, memcpy does not */
+```text output
+2 12 34
+```
+
+## memmove allows overlap; memcpy does not
+
+Copying a range onto itself is undefined for `memcpy`. `memmove` is
+defined for that case. Four bytes of `"abcdef"` slide two places right.
+
+```c file=n09.c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
     char s[] = "abcdef";
     memmove(s + 2, s, 4);
     printf("%s\n", s);
@@ -85,35 +227,9 @@ int main(void) {
 ```
 
 ```text output
-16 5
-Jello world
-1 1 1
-12 [abcdef-]
-bin local/bin
-123 [abc] 0
-1
-a|bb|ccc|
-MIXED CASE
-2 12 34
 ababcd
 ```
 
-## Details that bite
-
-- Always allocate `strlen(s) + 1` bytes: the terminator needs room.
-- **Never** use `gets`, `strcpy`, `strcat` or `sprintf` on data you do not
-  fully control. Use `snprintf`, or `memcpy` with explicit lengths.
-- `strncpy` does not guarantee a terminator and pads with zeros; it is not
-  a "safe strcpy". Terminate manually or avoid it.
-- Modifying a string literal (`char *p = "x"; p[0] = 'y';`) is undefined
-  behaviour. Declare `const char *` for literals.
-- `==` on `char *` compares pointers, not contents; use `strcmp`.
-- `atoi` cannot report errors. Use `strtol` and check `end` and `errno`.
-- `strlen` is O(n): do not call it in a loop condition on long strings.
-- `char` may be signed; pass `(unsigned char)c` to `toupper`, `isalpha`,
-  and friends.
-- Strings are bytes. UTF-8 text works with `strlen` for *byte* length, but
-  "number of characters" needs a decoder.
 
 ## Exercises
 

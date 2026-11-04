@@ -1,7 +1,7 @@
 # Rust by Example (practice edition)
 
-Rust 2021 edition. Each lesson is a single file you can build with
-`rustc --edition 2021 file.rs` (no Cargo needed). Exercise stubs call
+Rust 2021 edition. Each lesson is a series of tiny programs, one concept each
+(no Cargo): `rustc --edition 2021 -o n01 n01.rs && ./n01`. Exercise stubs call
 `todo!()` until you implement them.
 
 | # | Lesson | You will practise |

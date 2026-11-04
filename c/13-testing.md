@@ -1,18 +1,37 @@
 # C 13 — Testing
 
-C has no standard test framework. What it has is `assert` and `main`. A test harness is about thirty lines: a `CHECK` macro that records a failure and carries on, an array of `{name, function}`, and a loop. Build it once, build it small, and keep the habits that do the real work: table-driven cases, one behaviour per test, and every outside dependency passed in as a function pointer.
+C has no standard test framework. What it has is `assert` and `main`. A
+harness is about thirty lines: a `CHECK` macro that records a failure and
+carries on, an array of `{name, function}`, and a loop. Keep the habits
+that do the real work: table-driven cases, one behaviour per test, and
+every outside dependency passed in as a function pointer.
 
-## Example
+`assert` is not that framework. It aborts at the first failure, prints a
+location and nothing about which case, and disappears under `-DNDEBUG`,
+side effects included. Use it for invariants inside the code under test.
+Use `CHECK` so one run reports every case.
 
-```c file=example.c
-#include <assert.h>
+The macro is wrapped in `do { ... } while (0)` so it is one statement:
+`if (x) CHECK(...); else ...` still parses. The format arguments go
+through `__VA_ARGS__` to `snprintf`. Keep the first message and count the
+rest; a flood of follow-on lines usually hides the bug.
+
+Run tests under the sanitizers. A test that passes while reading past a
+buffer is worse than one that fails. Return a code from the code under
+test: `exit(1)` cannot be checked in-process. If you must test an abort,
+`fork` and look at the child's status. `main` returns nonzero when
+anything failed, so `make test` and CI do not have to parse the output.
+
+## A table is one test
+
+One array of inputs and expected strings, one loop. `CHECK` prints
+nothing on success. The harness prints one line for the whole test.
+
+```c file=n01.c
 #include <ctype.h>
-#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
-/* 1. The code under test: plain functions, no test hooks. */
 static void slugify(const char *in, char *out, size_t cap) {
     size_t n = 0;
     int dash = 0;
@@ -25,22 +44,112 @@ static void slugify(const char *in, char *out, size_t cap) {
             dash = 1;
         }
     }
-    while (n > 0 && out[n - 1] == '-') n--;
+    while (n > 0 && out[n - 1] == '-') {
+        n--;
+    }
     out[n] = '\0';
 }
 
-/* Returns 0 and sets *out, or -1 with errno = EINVAL / ERANGE. */
+static int failures;
+static char first_msg[160];
+
+#define CHECK(cond, ...)                                                       \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            if (!failures++)                                                   \
+                snprintf(first_msg, sizeof first_msg, __VA_ARGS__);            \
+        }                                                                      \
+    } while (0)
+
+static void test_slugify(void) {
+    static const struct {
+        const char *in, *want;
+    } cases[] = {
+        {"Hello World", "hello-world"},
+        {"  C, is -- fun!  ", "c-is-fun"},
+        {"", ""},
+        {"Top 10", "top-10"},
+    };
+    char got[64];
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        slugify(cases[i].in, got, sizeof got);
+        CHECK(strcmp(got, cases[i].want) == 0, "slugify(\"%s\") = \"%s\", want \"%s\"",
+              cases[i].in, got, cases[i].want);
+    }
+}
+
+int main(void) {
+    failures = 0;
+    test_slugify();
+    if (failures) {
+        printf("FAIL slugify: %s\n", first_msg);
+        return 1;
+    }
+    puts("PASS slugify");
+    puts("1/1 passed");
+    return 0;
+}
+```
+
+```text output
+PASS slugify
+1/1 passed
+```
+
+## errno is part of the result
+
+`parse_port` returns 0 or -1 and sets `errno` to `EINVAL` or `ERANGE`.
+The test can see both. A function that called `exit` on bad input could
+not be checked this way.
+
+```c file=n02.c
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 static int parse_port(const char *s, int *out) {
     char *end;
     errno = 0;
     long n = strtol(s, &end, 10);
-    if (end == s || *end != '\0') { errno = EINVAL; return -1; }
-    if (n < 1 || n > 65535)       { errno = ERANGE; return -1; }
+    if (end == s || *end != '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (n < 1 || n > 65535) {
+        errno = ERANGE;
+        return -1;
+    }
     *out = (int)n;
     return 0;
 }
 
-/* 2. Inject what the code cannot control (time, output) as a function pointer. */
+int main(void) {
+    int p = 0;
+    int ok = parse_port("8080", &p) == 0 && p == 8080;
+    ok = ok && parse_port("x", &p) == -1 && errno == EINVAL;
+    ok = ok && parse_port("70000", &p) == -1 && errno == ERANGE;
+    if (!ok) {
+        return 1;
+    }
+    puts("PASS parse_port");
+    return 0;
+}
+```
+
+```text output
+PASS parse_port
+```
+
+## Pass the clock in as a function
+
+The production code calls `hour(ctx)`. The test owns the `int` and moves
+time by assigning to it. That is a function pointer plus `void *`: C's
+version of an interface with state.
+
+```c file=n03.c
+#include <stdio.h>
+#include <string.h>
+
 typedef int (*hour_fn)(void *ctx);
 
 static void greet(hour_fn hour, void *ctx, const char *name, char *out, size_t cap) {
@@ -49,18 +158,80 @@ static void greet(hour_fn hour, void *ctx, const char *name, char *out, size_t c
 
 static int fake_hour(void *ctx) { return *(int *)ctx; }
 
-/* 3. A miniature test harness: CHECK records a failure and carries on. */
-static int failures;     /* failed checks in the current test */
+int main(void) {
+    char out[64];
+    int h = 9;
+    greet(fake_hour, &h, "Ada", out, sizeof out);
+    if (strcmp(out, "good morning, Ada") != 0) {
+        return 1;
+    }
+    h = 20;
+    greet(fake_hour, &h, "Bob", out, sizeof out);
+    if (strcmp(out, "good evening, Bob") != 0) {
+        return 1;
+    }
+    puts("PASS greet");
+    return 0;
+}
+```
+
+```text output
+PASS greet
+```
+
+## The harness runs a list and keeps the first failure
+
+Each element is a name and a function. One failure does not stop the
+loop. The message names the input, what came back, and what was wanted.
+`"A b"` slugifies to `a-b`, so a check against `a_b` fails and the rest
+of the program still runs.
+
+```c file=n04.c
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+static void slugify(const char *in, char *out, size_t cap) {
+    size_t n = 0;
+    int dash = 0;
+    for (; *in && n + 1 < cap; in++) {
+        if (isalnum((unsigned char)*in)) {
+            out[n++] = (char)tolower((unsigned char)*in);
+            dash = 0;
+        } else if (!dash && n > 0) {
+            out[n++] = '-';
+            dash = 1;
+        }
+    }
+    while (n > 0 && out[n - 1] == '-') {
+        n--;
+    }
+    out[n] = '\0';
+}
+
+static int failures;
 static char first_msg[160];
 
-#define CHECK(cond, ...)                                         \
-    do {                                                         \
-        if (!(cond)) {                                           \
-            if (!failures++) snprintf(first_msg, sizeof first_msg, __VA_ARGS__); \
-        }                                                        \
+#define CHECK(cond, ...)                                                       \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            if (!failures++)                                                   \
+                snprintf(first_msg, sizeof first_msg, __VA_ARGS__);            \
+        }                                                                      \
     } while (0)
 
-typedef struct { const char *name; void (*fn)(void); } Test;
+typedef struct {
+    const char *name;
+    void (*fn)(void);
+} Test;
+
+static void test_ok(void) { CHECK(1, "unreachable"); }
+
+static void test_bad(void) {
+    char got[16];
+    slugify("A b", got, sizeof got);
+    CHECK(strcmp(got, "a_b") == 0, "slugify(\"A b\") = \"%s\", want \"a_b\"", got);
+}
 
 static int run(const Test *tests, int n) {
     int passed = 0;
@@ -78,77 +249,42 @@ static int run(const Test *tests, int n) {
     return passed;
 }
 
-/* 4. Table-driven tests: one array of cases, one loop. */
-static void test_slugify(void) {
-    static const struct { const char *in, *want; } cases[] = {
-        {"Hello World", "hello-world"},
-        {"  C, is -- fun!  ", "c-is-fun"},
-        {"", ""},
-        {"Top 10", "top-10"},
-    };
-    char got[64];
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        slugify(cases[i].in, got, sizeof got);
-        CHECK(strcmp(got, cases[i].want) == 0,
-              "slugify(\"%s\") = \"%s\", want \"%s\"", cases[i].in, got, cases[i].want);
-    }
-}
-
-static void test_parse_port(void) {
-    int p = 0;
-    CHECK(parse_port("8080", &p) == 0 && p == 8080, "8080 gave %d", p);
-    CHECK(parse_port("x", &p) == -1 && errno == EINVAL, "x should be EINVAL");
-    CHECK(parse_port("70000", &p) == -1 && errno == ERANGE, "70000 should be ERANGE");
-}
-
-static void test_greet(void) {
-    char out[64];
-    int h = 9;
-    greet(fake_hour, &h, "Ada", out, sizeof out);
-    CHECK(strcmp(out, "good morning, Ada") == 0, "got \"%s\"", out);
-    h = 20;
-    greet(fake_hour, &h, "Bob", out, sizeof out);
-    CHECK(strcmp(out, "good evening, Bob") == 0, "got \"%s\"", out);
-}
-
 int main(void) {
-    const Test tests[] = {
-        {"slugify", test_slugify},
-        {"parse_port", test_parse_port},
-        {"greet", test_greet},
-    };
-    run(tests, 3);
-
-    /* A failing check names the input, the result and the expectation. */
-    char got[16];
-    slugify("A b", got, sizeof got);
-    failures = 0;
-    CHECK(strcmp(got, "a_b") == 0, "slugify(\"A b\") = \"%s\", want \"a_b\"", got);
-    printf("caught: %s\n", first_msg);
-
-    /* assert() is the other tool: it aborts, so it guards invariants, not cases. */
-    assert(failures == 1);
+    const Test tests[] = {{"ok", test_ok}, {"slug", test_bad}};
+    run(tests, 2);
     return 0;
 }
 ```
 
 ```text output
-PASS slugify
-PASS parse_port
-PASS greet
-3/3 passed
-caught: slugify("A b") = "a-b", want "a_b"
+PASS ok
+FAIL slug: slugify("A b") = "a-b", want "a_b"
+1/2 passed
 ```
 
-## Details that bite
+## assert guards the invariant, then you continue
 
-- **`assert` is not a test framework.** It aborts at the first failure, prints a location and nothing about which case, and vanishes under `-DNDEBUG`. Use it for invariants in the code under test, and a `CHECK`-style macro for test cases so one run reports every failure.
-- **Macros need `do { ... } while (0)`.** It makes `CHECK(...)` behave as one statement, so `if (x) CHECK(...); else ...` parses. The format arguments are passed through `__VA_ARGS__` to `snprintf`.
-- **Record the first message, count the rest.** The harness keeps one buffer for the first failure per test. That is enough to find the bug, and a flood of follow-on messages usually is not.
-- **Function pointer plus `void *ctx`** is C's version of an interface with state. The fake clock reads an `int` or `double` the test owns, so the test moves time by assigning to a local.
-- **Run the tests under the sanitizers.** The verifier builds with `-fsanitize=address,undefined`. A test that passes while reading past a buffer is worse than one that fails, and the sanitizers turn it into a failure.
-- **Return codes are testable, `exit` is not.** Code that calls `exit(1)` on bad input cannot be tested in-process. Return an error, as `parse_port` does, and let `main` decide. If you must test an abort, `fork()` and check the child's status.
-- **Exit status is the contract.** `main` returns non-zero when anything failed, so `make test` and CI see it without parsing output.
+After the harness has counted the deliberate failure, `assert` checks
+that the count is what this program expects. It is not the test of
+`slugify`. A false assert would abort the process here; `-DNDEBUG` would
+delete the check entirely.
+
+```c file=n05.c
+#include <assert.h>
+#include <stdio.h>
+
+int main(void) {
+    int failures = 1;
+    assert(failures == 1);
+    puts("assert held");
+    return 0;
+}
+```
+
+```text output
+assert held
+```
+
 
 ## Exercises
 

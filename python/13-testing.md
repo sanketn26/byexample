@@ -1,19 +1,156 @@
 # Python 13 — Testing
 
-`unittest` ships with Python; `pytest` is the popular layer on top. The
-ideas — arrange/act/assert, isolation, fakes — are the same. Here we run the
-tests from inside a script so the lesson is self-contained; normally you
-run `python -m unittest` or `pytest`.
+`unittest` ships with Python. `pytest` is the popular layer on top. The
+ideas — arrange, act, assert, isolation, fakes — are the same. These
+programs run the tests themselves. Normally you run `python -m unittest`
+or `pytest`.
 
-## Example
+## Each test starts from a fresh `setUp`
 
-```python file=example.py
-import doctest
+Tests must be independent and order-free. Share nothing mutable; build
+the state in `setUp` (or a pytest fixture). `subTest` names which row
+failed. `assertRaises` checks the type.
+
+```python file=n01.py
 import io
 import re
+import unittest
+
+
+def slugify(text):
+    if not isinstance(text, str):
+        raise TypeError("expected str")
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+class TestSlugify(unittest.TestCase):
+    def setUp(self):
+        self.cases = [("A B", "a-b"), ("--x--", "x"), ("", "")]
+
+    def test_basic(self):
+        self.assertEqual(slugify("Hello, World!"), "hello-world")
+
+    def test_table(self):
+        for raw, want in self.cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(slugify(raw), want)
+
+    def test_raises(self):
+        with self.assertRaises(TypeError):
+            slugify(None)
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestSlugify)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(result.testsRun, len(result.failures), len(result.errors), result.wasSuccessful())
+```
+
+```text output
+3 0 0 True
+```
+
+## Patch the name the code looks up
+
+`stamp` calls `time.time` on the `time` module, so the patch is
+`"time.time"`. If your module did `from time import time`, patch
+`"yourmodule.time"` instead, because that is the name the function loads.
+Prefer passing a clock or a client in. The code and the test both get
+simpler, and the exercise does it that way.
+
+```python file=n02.py
+import io
 import time
 import unittest
 from unittest import mock
+
+
+def stamp():
+    return f"t={time.time()}"
+
+
+class TestWithFakes(unittest.TestCase):
+    def test_patch_a_dependency(self):
+        with mock.patch("time.time", return_value=123.0):
+            self.assertEqual(stamp(), "t=123.0")
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestWithFakes)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(result.testsRun, len(result.failures), len(result.errors), result.wasSuccessful())
+```
+
+```text output
+1 0 0 True
+```
+
+## A mock records how it was called
+
+`Mock` returns another mock for any attribute. `return_value` is what the
+call returns. `assert_called_once_with` checks the arguments.
+
+```python file=n03.py
+import io
+import unittest
+from unittest import mock
+
+
+def notify(channel, message):
+    return channel.send(message.upper())
+
+
+class TestWithFakes(unittest.TestCase):
+    def test_mock_object(self):
+        channel = mock.Mock()
+        channel.send.return_value = True
+        self.assertTrue(notify(channel, "hi"))
+        channel.send.assert_called_once_with("HI")
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestWithFakes)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(result.testsRun, len(result.failures), result.wasSuccessful())
+```
+
+```text output
+1 0 True
+```
+
+## Watch a new test fail once
+
+A passing test you have never seen fail proves little. The failure list
+holds the test and its traceback. Test the behaviour a caller can see.
+A test that breaks on every internal rename is a tax, and a coverage
+number only says which lines ran.
+
+```python file=n04.py
+import io
+import unittest
+
+
+class Broken(unittest.TestCase):
+    def test_fails(self):
+        self.assertEqual(1 + 1, 3)
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(Broken)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(result.testsRun, len(result.failures), result.wasSuccessful())
+print(result.failures[0][1].strip().splitlines()[-1])
+```
+
+```text output
+1 1 False
+AssertionError: 2 != 3
+```
+
+## A doctest runs the examples in the docstring
+
+`doctest.testmod` executes each `>>>` line and compares what it prints.
+The function has to produce exactly that text.
+
+```python file=n05.py
+import doctest
+import re
 
 
 def slugify(text):
@@ -29,90 +166,37 @@ def slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
-def stamp():
-    return f"t={time.time()}"
-
-
-def notify(channel, message):
-    return channel.send(message.upper())
-
-
-class TestSlugify(unittest.TestCase):
-    def setUp(self):                      # runs before EVERY test
-        self.cases = [("A B", "a-b"), ("--x--", "x"), ("", "")]
-
-    def test_basic(self):
-        self.assertEqual(slugify("Hello, World!"), "hello-world")
-
-    def test_table(self):
-        for raw, want in self.cases:
-            with self.subTest(raw=raw):   # failures report which case
-                self.assertEqual(slugify(raw), want)
-
-    def test_raises(self):
-        with self.assertRaises(TypeError):
-            slugify(None)
-
-
-class TestWithFakes(unittest.TestCase):
-    def test_patch_a_dependency(self):
-        with mock.patch("time.time", return_value=123.0):
-            self.assertEqual(stamp(), "t=123.0")
-
-    def test_mock_object(self):
-        channel = mock.Mock()
-        channel.send.return_value = True
-        self.assertTrue(notify(channel, "hi"))
-        channel.send.assert_called_once_with("HI")
-
-
-class Broken(unittest.TestCase):
-    def test_fails(self):
-        self.assertEqual(1 + 1, 3)
-
-
-def run(*classes):
-    loader = unittest.defaultTestLoader
-    suite = unittest.TestSuite()
-    for cls in classes:
-        suite.addTests(loader.loadTestsFromTestCase(cls))
-    return unittest.TextTestRunner(stream=io.StringIO()).run(suite)
-
-
-good = run(TestSlugify, TestWithFakes)
-print(good.testsRun, len(good.failures), len(good.errors), good.wasSuccessful())
-
-bad = run(Broken)
-print(bad.testsRun, len(bad.failures), bad.wasSuccessful())
-print(bad.failures[0][1].strip().splitlines()[-1])
-
 print(doctest.testmod())
 ```
 
 ```text output
-5 0 0 True
-1 1 False
-AssertionError: 2 != 3
 TestResults(failed=0, attempted=2)
 ```
 
-## Details that bite
+## Compare floats with a tolerance
 
-- Tests must be **independent and order-free**. Share nothing mutable;
-  build fresh state in `setUp` (or fixtures in pytest).
-- Test behaviour, not implementation. A test that breaks on every
-  refactor is a tax, not a safety net.
-- Patch where a name is *looked up*, not where it is defined:
-  `mock.patch("mymodule.requests.get")`, not `"requests.get"`, when
-  `mymodule` did `import requests`.
-- Prefer injecting dependencies (a clock, a client) over patching; the
-  code and its tests both get simpler (see the exercise).
-- A passing test you have never seen fail proves little. Watch each new
-  test fail first.
-- Floating point: `assertAlmostEqual`, never `assertEqual`.
-- `assert` statements are stripped under `python -O`; use `unittest`
-  assertions or pytest's rewritten asserts.
-- Coverage numbers measure what ran, not what was verified.
+`assertAlmostEqual` allows a small difference. `assertEqual` does not.
+A bare `assert` is stripped under `python -O`, so use the unittest
+methods, or pytest's rewritten asserts.
+
+```python file=n06.py
+import io
+import unittest
+
+
+class TestFloat(unittest.TestCase):
+    def test_close(self):
+        self.assertAlmostEqual(0.1 + 0.2, 0.3)
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestFloat)
+result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(result.testsRun, len(result.failures), result.wasSuccessful())
+```
+
+```text output
+1 0 True
+```
 
 ## Exercises
 

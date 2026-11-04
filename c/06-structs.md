@@ -1,15 +1,40 @@
 # C 06 — Structs, Unions and Enums
 
-Structs group data; there are no methods. Unions overlap storage, which with
-a tag gives you sum types. Enums name integer constants.
+Structs group data. There are no methods. Unions overlap storage; a tag
+turns that overlap into a sum type. Enums name integer constants.
+Designated initializers set the members you name and zero the rest, so
+`= {0}` means "all zero".
 
-## Example
+## Designated initializers name the members
 
-```c file=example.c
-#include <stddef.h>
+`.x = 3` does not depend on declaration order.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
+struct point {
+    double x, y;
+};
+
+int main(void) {
+    struct point p = {.x = 3, .y = 4};
+    printf("%.1f %.1f\n", p.x, p.y);
+    return 0;
+}
+```
+
+```text output
+3.0 4.0
+```
+
+## A pointer argument is how you share a struct
+
+`->` reaches a member through that pointer. Pass `const` when the callee
+only reads. A large struct passed by value is copied; use a pointer for
+anything non-trivial.
+
+```c file=n02.c
+#include <stdio.h>
 
 struct point {
     double x, y;
@@ -23,17 +48,115 @@ static double rect_area(const Rect *r) {
     return (r->max.x - r->min.x) * (r->max.y - r->min.y);
 }
 
-/* Pass a pointer to modify; use -> to reach members */
+int main(void) {
+    Rect r = {.min = {0, 0}, .max = {4, 3}};
+    printf("%.1f\n", rect_area(&r));
+    return 0;
+}
+```
+
+```text output
+12.0
+```
+
+## Assignment copies every member
+
+`q = p` duplicates the values. Changing `q.x` leaves `p` alone. Structs
+cannot be compared with `==`. `memcmp` is also wrong: padding bytes are
+indeterminate. Compare the members.
+
+```c file=n03.c
+#include <stdio.h>
+
+struct point {
+    double x, y;
+};
+
+int main(void) {
+    struct point p = {.x = 3, .y = 4};
+    struct point q = p;
+    q.x = 9;
+    printf("%.1f %.1f\n", p.x, q.x);
+    return 0;
+}
+```
+
+```text output
+3.0 9.0
+```
+
+## Write members through the pointer
+
+`scale` changes the caller's object. The copy in the previous nugget
+could not.
+
+```c file=n04.c
+#include <stdio.h>
+
+struct point {
+    double x, y;
+};
+
 static void scale(struct point *p, double k) {
     p->x *= k;
     p->y *= k;
 }
 
-static void print_point(struct point p) { /* passed (copied) by value */
-    printf("(%.1f, %.1f)\n", p.x, p.y);
+int main(void) {
+    struct point p = {.x = 3, .y = 4};
+    scale(&p, 2);
+    printf("%.1f %.1f\n", p.x, p.y);
+    return 0;
 }
+```
 
-/* A tagged union: the enum says which member is valid */
+```text output
+6.0 8.0
+```
+
+## Padding satisfies alignment
+
+Members are laid out in order, then padded so each one is aligned.
+`padded` is 12 bytes here; putting the `int` first shrinks `reordered`
+to 8. `offsetof` is the byte offset of a member. Order fields from
+largest alignment to smallest when size matters.
+
+```c file=n05.c
+#include <stddef.h>
+#include <stdio.h>
+
+struct padded {
+    char a;
+    int b;
+    char c;
+};
+
+struct reordered {
+    int b;
+    char a;
+    char c;
+};
+
+int main(void) {
+    printf("%zu %zu %zu\n", sizeof(struct padded), sizeof(struct reordered),
+           offsetof(struct padded, b));
+    return 0;
+}
+```
+
+```text output
+12 8 4
+```
+
+## A tag says which union member is live
+
+Only the member you last wrote is safe to read, except for a few
+type-punning cases the standard carves out. Carry an enum and switch on
+it. Reading the wrong member is how tagged unions go wrong.
+
+```c file=n06.c
+#include <stdio.h>
+
 struct value {
     enum { V_INT, V_DOUBLE, V_STR } kind;
     union {
@@ -57,17 +180,33 @@ static void print_value(const struct value *v) {
     }
 }
 
-struct padded {
-    char a;
-    int b;
-    char c;
-};
+int main(void) {
+    struct value vals[] = {
+        {.kind = V_INT, .as.i = 42},
+        {.kind = V_DOUBLE, .as.d = 2.5},
+        {.kind = V_STR, .as.s = "hi"},
+    };
+    for (int i = 0; i < 3; i++) {
+        print_value(&vals[i]);
+    }
+    return 0;
+}
+```
 
-struct reordered {
-    int b;
-    char a;
-    char c;
-};
+```text output
+int 42
+double 2.5
+str hi
+```
+
+## Bit-fields pack flags into one word
+
+The widths are in bits. Layout, padding, and whether a bit-field is
+signed are implementation-defined. Do not use them for a wire format or
+for a hardware register you must lay out portably.
+
+```c file=n07.c
+#include <stdio.h>
 
 struct perms {
     unsigned read : 1;
@@ -75,11 +214,52 @@ struct perms {
     unsigned exec : 1;
 };
 
-/* Flexible array member: header and data in one allocation */
-struct buf {
-    size_t len;
-    char data[];
+int main(void) {
+    struct perms pm = {0};
+    pm.write = 1;
+    printf("%u %u %u\n", pm.read, pm.write, pm.exec);
+    return 0;
+}
+```
+
+```text output
+0 1 0
+```
+
+## A compound literal is an unnamed object
+
+`(struct point){1, 2}` creates a temporary you can pass by value. The
+parameter is a copy, so the function cannot change a caller it does not
+have.
+
+```c file=n08.c
+#include <stdio.h>
+
+struct point {
+    double x, y;
 };
+
+static void print_point(struct point p) {
+    printf("(%.1f, %.1f)\n", p.x, p.y);
+}
+
+int main(void) {
+    print_point((struct point){1, 2});
+    return 0;
+}
+```
+
+```text output
+(1.0, 2.0)
+```
+
+## An array of structs is a table
+
+Each element is a full struct. The loop sums one member and ignores the
+other.
+
+```c file=n09.c
+#include <stdio.h>
 
 struct employee {
     const char *name;
@@ -87,44 +267,65 @@ struct employee {
 };
 
 int main(void) {
-    struct point p = {.x = 3, .y = 4}; /* designated initialiser */
-    printf("%.1f %.1f\n", p.x, p.y);
-
-    Rect r = {.min = {0, 0}, .max = {4, 3}};
-    printf("%.1f\n", rect_area(&r));
-
-    struct point q = p; /* assignment copies every member */
-    q.x = 9;
-    printf("%.1f %.1f\n", p.x, q.x);
-
-    scale(&p, 2);
-    printf("%.1f %.1f\n", p.x, p.y);
-
-    printf("%zu %zu %zu\n", sizeof(struct padded), sizeof(struct reordered),
-           offsetof(struct padded, b));
-
-    struct value vals[] = {
-        {.kind = V_INT, .as.i = 42},
-        {.kind = V_DOUBLE, .as.d = 2.5},
-        {.kind = V_STR, .as.s = "hi"},
-    };
-    for (size_t i = 0; i < sizeof vals / sizeof vals[0]; i++) {
-        print_value(&vals[i]);
-    }
-
-    struct perms pm = {0};
-    pm.write = 1;
-    printf("%u %u %u\n", pm.read, pm.write, pm.exec);
-
-    print_point((struct point){1, 2}); /* compound literal */
-
     struct employee staff[] = {{"a", 10}, {"b", 20}, {"c", 30}};
     int total = 0;
-    for (size_t i = 0; i < sizeof staff / sizeof staff[0]; i++) {
+    for (int i = 0; i < 3; i++) {
         total += staff[i].salary;
     }
     printf("total=%d\n", total);
+    return 0;
+}
+```
 
+```text output
+total=60
+```
+
+## A struct may point at its own type
+
+The type name has to exist before the member that uses it. `typedef
+struct node Node;` before the body lets you write `Node *next` inside
+the definition. The form below names the struct in the same declaration.
+
+```c file=n10.c
+#include <stdio.h>
+
+struct node {
+    int value;
+    struct node *next;
+};
+
+int main(void) {
+    struct node c = {3, NULL};
+    struct node b = {2, &c};
+    struct node a = {1, &b};
+    printf("%d\n", a.next->next->value);
+    return 0;
+}
+```
+
+```text output
+3
+```
+
+## A flexible array member shares one allocation
+
+`sizeof(struct buf)` does not include `data`. Add the bytes you need
+when you call `malloc`. The header and the bytes are one block, freed
+once.
+
+```c file=n11.c
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct buf {
+    size_t len;
+    char data[];
+};
+
+int main(void) {
     struct buf *b = malloc(sizeof *b + 6);
     if (!b) {
         return 1;
@@ -138,39 +339,9 @@ int main(void) {
 ```
 
 ```text output
-3.0 4.0
-12.0
-3.0 9.0
-6.0 8.0
-12 8 4
-int 42
-double 2.5
-str hi
-0 1 0
-(1.0, 2.0)
-total=60
 5 hello
 ```
 
-## Details that bite
-
-- Members are laid out in order, with **padding** to satisfy alignment.
-  Reordering members from largest to smallest alignment shrinks structs
-  (compare `sizeof(struct padded)` and `sizeof(struct reordered)`).
-- Do not compare structs with `==` (not allowed) or `memcmp` (padding
-  bytes are indeterminate). Compare member by member.
-- Large structs passed by value are copied; pass `const struct x *` for
-  anything non-trivial.
-- Reading a union member other than the one last written is only
-  well-defined in limited cases; always carry a tag.
-- Bit-field layout and signedness are implementation-defined. Do not use
-  them for wire formats or hardware registers you must be portable about.
-- `typedef struct node Node;` before the definition allows self-referential
-  types: `struct node { struct node *next; };`.
-- `sizeof` a struct with a flexible array member excludes the array; add
-  the space you need when you allocate.
-- Designated initialisers zero everything you do not name; `= {0}` is the
-  idiom for "all zero".
 
 ## Exercises
 

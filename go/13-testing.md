@@ -1,21 +1,31 @@
 # Go 13 — Testing
 
-Go ships a `testing` package and `go test`, which finds `TestXxx(t *testing.T)` functions in `_test.go` files. Lessons here are single files you run directly, so the example carries a miniature `T` with the same `Errorf`/`Run` shape. The habits are the ones that matter: table-driven cases, a subtest per case, errors compared with `errors.Is`, and anything non-deterministic injected as an interface.
+Go ships `testing` and `go test`, which finds `TestXxx(t *testing.T)` in
+`_test.go` files. These lessons are single files, so each program carries a
+miniature `T` with the same `Errorf` and `Run` shape. Put production code
+in `slug.go` and the tests in `slug_test.go` (same package), rename `T` to
+`*testing.T`, and run `go test ./...`. Add `-run Name/sub` to pick one
+subtest, `-race` for data races, and `-cover` for coverage. The test bodies
+do not change. `Errorf` keeps going so every failing case shows up;
+`Fatalf` stops when the rest of the test cannot make sense, such as after
+a failed setup. Fakes beat mocks: a small struct that satisfies the
+interface cannot rot the way a recording framework can. Inject that fake.
+Do not stub a global, and do not compare `err.Error()` to a string.
 
-## Example
+## A table of cases, one subtest each
 
-```go file=example.go
+The slice is the whole test. `Run` names the row, and a failure is prefixed
+with that name. Since Go 1.22 each iteration has its own `tc`, so the
+closure is safe even with `t.Parallel()`. Older code copied it (`tc := tc`).
+
+```go file=n01.go
 package main
 
 import (
-	"errors"
 	"fmt"
-	"io"
-	"strconv"
 	"strings"
 )
 
-// 1. The code under test: plain functions, no test hooks.
 func Slugify(s string) string {
 	var b strings.Builder
 	dash := false
@@ -31,17 +41,108 @@ func Slugify(s string) string {
 	return strings.TrimRight(b.String(), "-")
 }
 
+type T struct{ msgs []string }
+
+func (t *T) Errorf(format string, args ...any) {
+	t.msgs = append(t.msgs, fmt.Sprintf(format, args...))
+}
+
+func (t *T) Run(name string, fn func(*T)) {
+	sub := &T{}
+	fn(sub)
+	for _, m := range sub.msgs {
+		t.Errorf("%s: %s", name, m)
+	}
+}
+
+func main() {
+	cases := []struct{ name, in, want string }{
+		{"plain", "Hello World", "hello-world"},
+		{"punct", "  Go, is -- fun!  ", "go-is-fun"},
+		{"empty", "", ""},
+		{"digits", "Top 10", "top-10"},
+	}
+	t := &T{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *T) {
+			if got := Slugify(tc.in); got != tc.want {
+				t.Errorf("Slugify(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	if len(t.msgs) == 0 {
+		fmt.Println("PASS Slugify")
+	} else {
+		fmt.Println("FAIL", t.msgs)
+	}
+}
+```
+
+```text output
+PASS Slugify
+```
+
+## Compare errors with `errors.Is`
+
+`ParsePort` wraps a sentinel. The test asks `errors.Is`, not `==` and not
+the message text. The message is for humans and will change.
+
+```go file=n02.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+)
+
 var ErrPort = errors.New("bad port")
 
 func ParsePort(s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 || n > 65535 {
-		return 0, fmt.Errorf("%w: %q", ErrPort, s) // wrap a sentinel
+		return 0, fmt.Errorf("%w: %q", ErrPort, s)
 	}
 	return n, nil
 }
 
-// 2. Inject what the code cannot control (time, output) as interfaces.
+func main() {
+	ok := true
+	if n, err := ParsePort("8080"); err != nil || n != 8080 {
+		ok = false
+		fmt.Println("got", n, err)
+	}
+	for _, in := range []string{"", "x", "0", "70000"} {
+		if _, err := ParsePort(in); !errors.Is(err, ErrPort) {
+			ok = false
+			fmt.Printf("ParsePort(%q) error = %v\n", in, err)
+		}
+	}
+	if ok {
+		fmt.Println("PASS ParsePort")
+	}
+}
+```
+
+```text output
+PASS ParsePort
+```
+
+## Inject the clock and the writer
+
+`time.Now` inside the function cannot be tested. `Greeter` takes a `Clock`
+and an `io.Writer`. The fake clock returns the hour you set, and a
+`strings.Builder` captures the greeting.
+
+```go file=n03.go
+package main
+
+import (
+	"fmt"
+	"io"
+	"strings"
+)
+
 type Clock interface{ Hour() int }
 
 type Greeter struct {
@@ -61,18 +162,40 @@ type FakeClock struct{ hour int }
 
 func (f FakeClock) Hour() int { return f.hour }
 
-// 3. A miniature of testing.T. With `go test` the real one does this.
-type T struct {
-	failed bool
-	msgs   []string
+func main() {
+	var sb strings.Builder
+	Greeter{FakeClock{9}, &sb}.Greet("Ada")
+	Greeter{FakeClock{20}, &sb}.Greet("Bob")
+	want := "good morning, Ada\ngood evening, Bob\n"
+	if sb.String() == want {
+		fmt.Println("PASS Greet")
+	} else {
+		fmt.Printf("got %q, want %q\n", sb.String(), want)
+	}
 }
+```
+
+```text output
+PASS Greet
+```
+
+## A failure names the input, the result, and the expectation
+
+`Run` folds the subtest name onto the message. The line tells you which
+case, what `Slugify` returned, and what the test wanted. That is the whole
+report.
+
+```go file=n04.go
+package main
+
+import "fmt"
+
+type T struct{ msgs []string }
 
 func (t *T) Errorf(format string, args ...any) {
-	t.failed = true
 	t.msgs = append(t.msgs, fmt.Sprintf(format, args...))
 }
 
-// Run starts a named subtest and folds its failure into the parent.
 func (t *T) Run(name string, fn func(*T)) {
 	sub := &T{}
 	fn(sub)
@@ -81,91 +204,18 @@ func (t *T) Run(name string, fn func(*T)) {
 	}
 }
 
-type Test struct {
-	Name string
-	Fn   func(*T)
-}
-
-func run(tests []Test) int {
-	passed := 0
-	for _, tc := range tests {
-		t := &T{}
-		tc.Fn(t)
-		if t.failed {
-			fmt.Printf("FAIL %s: %s\n", tc.Name, strings.Join(t.msgs, "; "))
-		} else {
-			fmt.Printf("PASS %s\n", tc.Name)
-			passed++
-		}
-	}
-	fmt.Printf("%d/%d passed\n", passed, len(tests))
-	return passed
-}
-
-// 4. Table-driven tests: one slice of cases, one loop, one subtest each.
-func TestSlugify(t *T) {
-	cases := []struct{ name, in, want string }{
-		{"plain", "Hello World", "hello-world"},
-		{"punct", "  Go, is -- fun!  ", "go-is-fun"},
-		{"empty", "", ""},
-		{"digits", "Top 10", "top-10"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *T) {
-			if got := Slugify(tc.in); got != tc.want {
-				t.Errorf("Slugify(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestParsePort(t *T) {
-	if n, err := ParsePort("8080"); err != nil || n != 8080 {
-		t.Errorf("got %d, %v", n, err)
-	}
-	for _, in := range []string{"", "x", "0", "70000"} {
-		if _, err := ParsePort(in); !errors.Is(err, ErrPort) { // errors.Is, not ==
-			t.Errorf("ParsePort(%q) error = %v, want ErrPort", in, err)
-		}
-	}
-}
-
-func TestGreet(t *T) {
-	var sb strings.Builder
-	Greeter{FakeClock{9}, &sb}.Greet("Ada")
-	Greeter{FakeClock{20}, &sb}.Greet("Bob")
-	want := "good morning, Ada\ngood evening, Bob\n"
-	if sb.String() != want {
-		t.Errorf("got %q, want %q", sb.String(), want)
-	}
-}
-
 func main() {
-	run([]Test{{"Slugify", TestSlugify}, {"ParsePort", TestParsePort}, {"Greet", TestGreet}})
-
-	// A failing test names the input, the result and the expectation.
 	broken := &T{}
-	broken.Run("case", func(t *T) { t.Errorf("Slugify(%q) = %q, want %q", "A b", "a-b", "a_b") })
+	broken.Run("case", func(t *T) {
+		t.Errorf("Slugify(%q) = %q, want %q", "A b", "a-b", "a_b")
+	})
 	fmt.Println("caught:", broken.msgs[0])
 }
 ```
 
 ```text output
-PASS Slugify
-PASS ParsePort
-PASS Greet
-3/3 passed
 caught: case: Slugify("A b") = "a-b", want "a_b"
 ```
-
-## Details that bite
-
-- **The real thing.** Put the code in `slug.go` and the tests in `slug_test.go` (same package), rename `T` to `*testing.T`, and run `go test ./...`. The bodies of `TestSlugify` and friends do not change. Add `-run Name/sub` to pick one, `-race` to hunt data races, `-cover` for coverage.
-- **`Errorf` continues, `Fatalf` stops.** Use `Errorf` to see every failing case in one run. Use `Fatalf` when the rest of the test cannot make sense, such as after a failed setup.
-- **Capture the loop variable.** Since Go 1.22 each iteration has its own `tc`, so a subtest closure is safe even with `t.Parallel()`. Older code copied it (`tc := tc`).
-- **Compare errors with `errors.Is` / `errors.As`,** never `err.Error() == "..."`. The message is for humans and changes.
-- **Inject, do not stub globals.** `time.Now()` called inside the function is untestable. Take a `Clock` (or a `func() time.Time`) and pass a fake. The same goes for `io.Writer` instead of `os.Stdout`.
-- **Fakes beat mocks.** A twelve-line struct that satisfies the interface is easier to read than a recording framework, and it cannot rot silently.
 
 ## Exercises
 

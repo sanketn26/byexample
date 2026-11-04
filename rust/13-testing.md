@@ -1,15 +1,26 @@
 # Rust 13 — Testing
 
-Rust builds testing into the toolchain: `#[test]` functions run by `cargo test` (or `rustc --test file.rs`). Lessons here are plain `rustc` programs, so the example writes a miniature of that harness: run each test, catch the panic, report. The last block of the example is the real `#[cfg(test)]` form wrapping the same functions, and it compiles with `rustc --test`.
+`#[test]` functions run under `cargo test`, or under `rustc --edition 2021
+--test file.rs`. They run in parallel, in one process, so a test must not
+depend on another test or on a global. `println!` inside a passing test is
+hidden. `-- --nocapture` shows it. These lessons are plain `rustc` programs,
+so each one below carries a miniature of that harness: run the function,
+catch a panic, print a line. A fenced block in a `///` comment is a doctest.
+`cargo test` compiles it too.
 
-## Example
+## A table of cases is one test
 
-```rust file=example.rs
+`assert_eq!` prints both sides, so prefer it to `assert!(a == b)`. Add a
+message when a loop hides which case failed. Unit tests live in
+`#[cfg(test)] mod tests` next to the code, which is why they can call a
+private function. Integration tests live in `tests/` and see only the public
+API. The module at the bottom is that real form. `rustc --test` runs it.
+This plain build does not.
+
+```rust file=n01.rs
 use std::error::Error;
-use std::fmt::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 
-// 1. The code under test: plain functions, no test hooks.
 fn slugify(s: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
@@ -28,44 +39,6 @@ fn slugify(s: &str) -> String {
     out
 }
 
-#[derive(Debug, PartialEq)]
-enum PortError {
-    NotANumber,
-    OutOfRange(u32),
-}
-
-fn parse_port(s: &str) -> Result<u16, PortError> {
-    let n: u32 = s.parse().map_err(|_| PortError::NotANumber)?;
-    if n == 0 || n > 65535 {
-        return Err(PortError::OutOfRange(n));
-    }
-    Ok(n as u16)
-}
-
-fn first(v: &[i32]) -> i32 {
-    v[0] // panics on an empty slice
-}
-
-// 2. Inject what the code cannot control (time, output) behind a trait.
-trait Clock {
-    fn hour(&self) -> u32;
-}
-
-fn greet(clock: &dyn Clock, name: &str, out: &mut dyn Write) -> fmt::Result {
-    let part = if clock.hour() < 12 { "morning" } else { "evening" };
-    writeln!(out, "good {part}, {name}")
-}
-
-struct FakeClock(u32);
-
-impl Clock for FakeClock {
-    fn hour(&self) -> u32 {
-        self.0
-    }
-}
-
-// 3. The tests. Each is a plain function: a panic is a failure, and
-// returning Result lets `?` fail a test with the error it hit.
 type Outcome = Result<(), Box<dyn Error>>;
 
 fn test_slugify() -> Outcome {
@@ -81,30 +54,8 @@ fn test_slugify() -> Outcome {
     Ok(())
 }
 
-fn test_parse_port() -> Outcome {
-    assert_eq!(parse_port("8080"), Ok(8080));
-    assert_eq!(parse_port("x"), Err(PortError::NotANumber));
-    assert_eq!(parse_port("70000"), Err(PortError::OutOfRange(70000)));
-    Ok(())
-}
-
-fn test_greet() -> Outcome {
-    let mut out = String::new();
-    greet(&FakeClock(9), "Ada", &mut out)?; // fmt::Error converts via `?`
-    greet(&FakeClock(20), "Bob", &mut out)?;
-    assert_eq!(out, "good morning, Ada\ngood evening, Bob\n");
-    Ok(())
-}
-
-fn test_first_panics_on_empty() -> Outcome {
-    assert_eq!(first(&[7, 8]), 7);
-    assert!(panic::catch_unwind(|| first(&[])).is_err()); // what #[should_panic] does
-    Ok(())
-}
-
-// 4. A miniature of libtest: run each test, catch a panic, report.
-fn run(tests: &[(&str, fn() -> Outcome)]) -> usize {
-    panic::set_hook(Box::new(|_| {})); // keep panic noise off stderr
+fn run(tests: &[(&str, fn() -> Outcome)]) {
+    panic::set_hook(Box::new(|_| {}));
     let mut passed = 0;
     for (name, f) in tests {
         match panic::catch_unwind(AssertUnwindSafe(f)) {
@@ -117,32 +68,19 @@ fn run(tests: &[(&str, fn() -> Outcome)]) -> usize {
                 let msg = p
                     .downcast_ref::<String>()
                     .cloned()
-                    .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_string()))
                     .unwrap_or_default();
                 println!("FAIL {name}: {}", msg.replace('\n', " | "));
             }
         }
     }
     println!("{passed}/{} passed", tests.len());
-    passed
 }
 
 fn main() {
-    run(&[
-        ("slugify", test_slugify),
-        ("parse_port", test_parse_port),
-        ("greet", test_greet),
-        ("first_panics_on_empty", test_first_panics_on_empty),
-    ]);
-
-    // A failing assert names both sides.
-    run(&[("broken", || {
-        assert_eq!(slugify("A b"), "a_b");
-        Ok(())
-    })]);
+    run(&[("slugify", test_slugify)]);
 }
 
-// The same functions under `rustc --test` (or `cargo test`): no harness to write.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +89,151 @@ mod tests {
     fn slugify_table() -> Outcome {
         test_slugify()
     }
+}
+```
+
+```text output
+PASS slugify
+1/1 passed
+```
+
+## Assert the `Err`, not only the `Ok`
+
+A parser's failure values are part of the contract. `assert_eq!` on a
+`Result` checks both arms. A test function may itself return `Result`. `?`
+then fails the test with that error instead of a panic from `unwrap`.
+
+```rust file=n02.rs
+use std::error::Error;
+use std::panic::{self, AssertUnwindSafe};
+
+#[derive(Debug, PartialEq)]
+enum PortError {
+    NotANumber,
+    OutOfRange(u32),
+}
+
+fn parse_port(s: &str) -> Result<u16, PortError> {
+    let n: u32 = s.parse().map_err(|_| PortError::NotANumber)?;
+    if n == 0 || n > 65535 {
+        return Err(PortError::OutOfRange(n));
+    }
+    Ok(n as u16)
+}
+
+type Outcome = Result<(), Box<dyn Error>>;
+
+fn test_parse_port() -> Outcome {
+    assert_eq!(parse_port("8080"), Ok(8080));
+    assert_eq!(parse_port("x"), Err(PortError::NotANumber));
+    assert_eq!(parse_port("70000"), Err(PortError::OutOfRange(70000)));
+    Ok(())
+}
+
+fn main() {
+    panic::set_hook(Box::new(|_| {}));
+    match panic::catch_unwind(AssertUnwindSafe(test_parse_port)) {
+        Ok(Ok(())) => println!("PASS parse_port"),
+        Ok(Err(e)) => println!("FAIL parse_port: {e}"),
+        Err(_) => println!("FAIL parse_port"),
+    }
+}
+```
+
+```text output
+PASS parse_port
+```
+
+## A trait is the seam for a fake
+
+`greet` asks a `Clock` and writes to anything that implements `Write`. The
+test passes a `FakeClock`. `Cell` lets the fake move time forward even
+though `hour` takes `&self`. `writeln!` returns `fmt::Result`, and `?`
+turns that into the test's `Result`.
+
+```rust file=n03.rs
+use std::cell::Cell;
+use std::error::Error;
+use std::fmt::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
+
+trait Clock {
+    fn hour(&self) -> u32;
+}
+
+fn greet(clock: &dyn Clock, name: &str, out: &mut dyn Write) -> fmt::Result {
+    let part = if clock.hour() < 12 { "morning" } else { "evening" };
+    writeln!(out, "good {part}, {name}")
+}
+
+struct FakeClock(Cell<u32>);
+
+impl Clock for FakeClock {
+    fn hour(&self) -> u32 {
+        self.0.get()
+    }
+}
+
+type Outcome = Result<(), Box<dyn Error>>;
+
+fn test_greet() -> Outcome {
+    let clock = FakeClock(Cell::new(9));
+    let mut out = String::new();
+    greet(&clock, "Ada", &mut out)?;
+    clock.0.set(20);
+    greet(&clock, "Bob", &mut out)?;
+    assert_eq!(out, "good morning, Ada\ngood evening, Bob\n");
+    Ok(())
+}
+
+fn main() {
+    panic::set_hook(Box::new(|_| {}));
+    match panic::catch_unwind(AssertUnwindSafe(test_greet)) {
+        Ok(Ok(())) => println!("PASS greet"),
+        other => println!("FAIL greet {other:?}"),
+    }
+}
+```
+
+```text output
+PASS greet
+```
+
+## `catch_unwind` is what `#[should_panic]` does
+
+`#[should_panic]` passes only when the body panics. Add `expected =
+"substring"` so the wrong panic does not count as success. Prefer returning
+a `Result` from the code, and asserting the `Err`, when the failure is
+recoverable. A panic is the right signal for a broken precondition, such as
+indexing an empty slice.
+
+```rust file=n04.rs
+use std::error::Error;
+use std::panic::{self, AssertUnwindSafe};
+
+fn first(v: &[i32]) -> i32 {
+    v[0]
+}
+
+type Outcome = Result<(), Box<dyn Error>>;
+
+fn test_first_panics_on_empty() -> Outcome {
+    assert_eq!(first(&[7, 8]), 7);
+    assert!(panic::catch_unwind(|| first(&[])).is_err());
+    Ok(())
+}
+
+fn main() {
+    panic::set_hook(Box::new(|_| {}));
+    match panic::catch_unwind(AssertUnwindSafe(test_first_panics_on_empty)) {
+        Ok(Ok(())) => println!("PASS first_panics_on_empty"),
+        other => println!("FAIL first_panics_on_empty {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     #[should_panic]
@@ -161,24 +244,59 @@ mod tests {
 ```
 
 ```text output
-PASS slugify
-PASS parse_port
-PASS greet
 PASS first_panics_on_empty
-4/4 passed
+```
+
+## A failing `assert_eq!` names both sides
+
+The panic payload is a `String`. The harness turns its newlines into ` | `
+so the failure is one line. Zero tests passed.
+
+```rust file=n05.rs
+use std::error::Error;
+use std::panic::{self, AssertUnwindSafe};
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase().replace(' ', "-")
+}
+
+type Outcome = Result<(), Box<dyn Error>>;
+
+fn run(tests: &[(&str, fn() -> Outcome)]) {
+    panic::set_hook(Box::new(|_| {}));
+    let mut passed = 0;
+    for (name, f) in tests {
+        match panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(Ok(())) => {
+                println!("PASS {name}");
+                passed += 1;
+            }
+            Ok(Err(e)) => println!("FAIL {name}: {e}"),
+            Err(p) => {
+                let msg = p
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_default();
+                println!("FAIL {name}: {}", msg.replace('\n', " | "));
+            }
+        }
+    }
+    println!("{passed}/{} passed", tests.len());
+}
+
+fn main() {
+    run(&[("broken", || {
+        assert_eq!(slugify("A b"), "a_b");
+        Ok(())
+    })]);
+}
+```
+
+```text output
 FAIL broken: assertion `left == right` failed |   left: "a-b" |  right: "a_b"
 0/1 passed
 ```
-
-## Details that bite
-
-- **The real thing.** `rustc --edition 2021 --test file.rs && ./file` (or `cargo test`) runs every `#[test]` function in parallel and prints one line each. Unit tests live in a `#[cfg(test)] mod tests` beside the code, which is what lets them reach private functions. Integration tests live in `tests/` and see only the public API.
-- **A panic is a failure.** `assert!`, `assert_eq!` and `unwrap()` all panic. `assert_eq!` prints both sides, so prefer it over `assert!(a == b)`. Add a message (`assert_eq!(x, y, "case {name}")`) when a loop hides which case failed.
-- **Tests may return `Result`.** `fn t() -> Result<(), Box<dyn Error>>` lets you use `?` instead of `unwrap()`. A returned `Err` fails the test and prints the error.
-- **`#[should_panic]`** passes only if the body panics. Add `expected = "substring"` so it cannot pass for the wrong panic. Prefer returning a `Result` from the code and asserting the `Err` when you can.
-- **Trait objects are the seam.** Take `&dyn Clock` or a generic `C: Clock`, pass a fake in tests. Use `Cell` or `RefCell` inside the fake when the trait method takes `&self` but the test needs to move time forward.
-- **Output is captured.** `println!` inside a passing test is hidden. Run with `-- --nocapture` to see it. Tests share a process and run in parallel, so do not rely on shared global state or on test order.
-- **Doc tests.** A fenced block in a `///` comment is compiled and run by `cargo test`, so examples in documentation cannot go stale.
 
 ## Exercises
 

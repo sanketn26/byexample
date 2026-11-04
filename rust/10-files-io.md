@@ -1,17 +1,227 @@
 # Rust 10 — Files, I/O and Processes
 
-I/O is built on the `Read`, `Write` and `BufRead` traits. Every operation
-returns `io::Result`, so `?` makes the happy path read straight down. Files
-close automatically when dropped.
+I/O is the `Read`, `Write`, and `BufRead` traits. Every call returns
+`io::Result`, so `?` keeps the success path in a straight line. A `File` is
+closed when it is dropped. `main` may return `io::Result<()>`: an `Err`
+prints a debug message and the process exits non-zero.
 
-## Example
+## `write` and `read_to_string` move a whole file
 
-```rust file=example.rs
+`fs::write` creates or replaces the file. `read_to_string` fails if the
+bytes are not UTF-8. For arbitrary bytes, use `fs::read` and
+`String::from_utf8_lossy`.
+
+```rust file=n01.rs
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::fs;
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let notes = dir.join("notes.txt");
+    fs::write(&notes, "alpha\nbeta\ngamma\n")?;
+    let text = fs::read_to_string(&notes)?;
+    println!("{:?}", text.lines().collect::<Vec<_>>());
+    fs::write(dir.join("bad.bin"), [0xffu8])?;
+    println!("{}", fs::read_to_string(dir.join("bad.bin")).is_err());
+    println!("{}", String::from_utf8_lossy(&fs::read(dir.join("bad.bin"))?));
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+["alpha", "beta", "gamma"]
+true
+�
+```
+
+## `BufReader` reads a line at a time
+
+An unbuffered `File` is one syscall per `read`. Wrap it in `BufReader` for
+lines, and in `BufWriter` for many small writes. `lines` yields a `Result`
+per line because the underlying read can fail.
+
+```rust file=n02.rs
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let notes = dir.join("notes.txt");
+    fs::write(&notes, "alpha\nbeta\ngamma\n")?;
+    let reader = BufReader::new(File::open(&notes)?);
+    for (i, line) in reader.lines().enumerate() {
+        println!("{} {}", i + 1, line?);
+    }
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+1 alpha
+2 beta
+3 gamma
+```
+
+## Append, then drop the handle before you reread
+
+`OpenOptions` opens the file without truncating it. `drop(f)` closes the
+handle so the next read sees the new bytes. Drop would also close it at the
+end of the scope.
+
+```rust file=n03.rs
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let notes = dir.join("notes.txt");
+    fs::write(&notes, "alpha\nbeta\ngamma\n")?;
+    let mut f = OpenOptions::new().append(true).open(&notes)?;
+    writeln!(f, "delta")?;
+    drop(f);
+    println!("{}", fs::read_to_string(&notes)?.lines().count());
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+4
+```
+
+## Bytes and metadata are not text
+
+`fs::read` returns the raw `Vec<u8>`. `metadata().len()` is the length in
+bytes, here four.
+
+```rust file=n04.rs
+use std::env;
+use std::fs;
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let bin = dir.join("data.bin");
+    fs::write(&bin, [0u8, 1, 2, 255])?;
+    println!("{:?} {}", fs::read(&bin)?, fs::metadata(&bin)?.len());
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+[0, 1, 2, 255] 4
+```
+
+## `BufWriter` forgets a flush error on drop
+
+The buffer is flushed when the writer is dropped, and that flush ignores
+the error. Call `flush()?` when a short write must not disappear. The
+`Debug` of the string shows the newlines.
+
+```rust file=n05.rs
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("out.txt");
+    {
+        let mut w = BufWriter::new(File::create(&path)?);
+        for i in 0..3 {
+            writeln!(w, "line {i}")?;
+        }
+        w.flush()?;
+    }
+    println!("{:?}", fs::read_to_string(path)?);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+"line 0\nline 1\nline 2\n"
+```
+
+## `seek` and `read_exact` take a fixed slice
+
+`SeekFrom::Start(6)` is the byte offset of `beta` in `alpha\nbeta\ngamma\n`.
+`read_exact` fails if the file ends before the buffer is full.
+
+```rust file=n06.rs
+use std::env;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let notes = dir.join("notes.txt");
+    fs::write(&notes, "alpha\nbeta\ngamma\n")?;
+    let mut f = File::open(&notes)?;
+    f.seek(SeekFrom::Start(6))?;
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf)?;
+    println!("{}", String::from_utf8_lossy(&buf));
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+beta
+```
+
+## A few lines of CSV need no crate
+
+Skip the header. `split` and `parse` pull out one column. This is not a
+real CSV parser: no quotes, no escaped commas.
+
+```rust file=n07.rs
+use std::env;
+use std::fs;
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("people.csv");
+    fs::write(&path, "name,age\nAda,36\nLinus,55\n")?;
+    let csv = fs::read_to_string(&path)?;
+    let total: u32 = csv
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split(',').nth(1)?.parse::<u32>().ok())
+        .sum();
+    println!("{total}");
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+```text output
+91
+```
+
+## Replace a file by renaming in the same directory
+
+`std::fs` has no separate atomic-replace call. Write a temporary file next
+to the destination and `rename` it over the target. `rename` is atomic on
+one filesystem. Sort after `read_dir`: the order it yields is arbitrary.
+
+```rust file=n08.rs
+use std::env;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
 
 fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -29,85 +239,73 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
     fs::create_dir_all(&dir)?;
-
-    // Whole-file helpers
     let notes = dir.join("notes.txt");
-    fs::write(&notes, "alpha\nbeta\ngamma\n")?;
-    let text = fs::read_to_string(&notes)?;
-    println!("{:?}", text.lines().collect::<Vec<_>>());
-
-    // Streaming line by line
-    let reader = BufReader::new(File::open(&notes)?);
-    for (i, line) in reader.lines().enumerate() {
-        println!("{} {}", i + 1, line?);
-    }
-
-    // Appending
-    let mut f = OpenOptions::new().append(true).open(&notes)?;
-    writeln!(f, "delta")?;
-    drop(f);
-    println!("{}", fs::read_to_string(&notes)?.lines().count());
-
-    // Binary data and metadata
-    let bin = dir.join("data.bin");
-    fs::write(&bin, [0u8, 1, 2, 255])?;
-    println!("{:?} {}", fs::read(&bin)?, fs::metadata(&bin)?.len());
-
-    // Buffered writes (flushed on drop, but flush to see errors)
+    let tmp = dir.join("notes.txt.tmp");
     {
-        let mut w = BufWriter::new(File::create(dir.join("out.txt"))?);
-        for i in 0..3 {
-            writeln!(w, "line {i}")?;
-        }
-        w.flush()?;
+        let mut f = File::create(&tmp)?;
+        write!(f, "alpha\n")?;
+        f.sync_all()?;
     }
-    println!("{:?}", fs::read_to_string(dir.join("out.txt"))?);
-
-    // Seeking and fixed-size reads
-    let mut f = File::open(&notes)?;
-    f.seek(SeekFrom::Start(6))?;
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    println!("{}", String::from_utf8_lossy(&buf));
-
-    // A tiny CSV reader
-    fs::write(dir.join("people.csv"), "name,age\nAda,36\nLinus,55\n")?;
-    let csv = fs::read_to_string(dir.join("people.csv"))?;
-    let total: u32 = csv
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.split(',').nth(1)?.parse::<u32>().ok())
-        .sum();
-    println!("{total}");
-
-    // Directory walk
+    fs::rename(&tmp, &notes)?;
     fs::create_dir(dir.join("sub"))?;
     fs::write(dir.join("sub").join("x.rs"), "fn main() {}")?;
     let mut files = Vec::new();
     walk(&dir, &dir, &mut files)?;
-    files.sort(); // read_dir order is unspecified
-    println!("{files:?}");
+    files.sort();
+    println!("{files:?} {}", tmp.exists());
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
 
-    // Paths are values
+```text output
+["notes.txt", "sub/x.rs"] false
+```
+
+## `Path` is not a `String`
+
+Join with `Path::join`. Do not concatenate separators yourself. `file_name`,
+`extension`, and `parent` borrow from the path. `to_str` returns `Option`
+because a path is not guaranteed to be UTF-8. `OsString` is the owned form
+of those bytes.
+
+```rust file=n09.rs
+use std::path::{Path, PathBuf};
+
+fn main() {
     let p = Path::new("/tmp/archive.tar.gz");
-    println!("{:?} {:?} {:?}", p.file_name().unwrap(), p.extension().unwrap(), p.parent().unwrap());
+    println!(
+        "{:?} {:?} {:?}",
+        p.file_name().unwrap(),
+        p.extension().unwrap(),
+        p.parent().unwrap()
+    );
     println!("{}", PathBuf::from("a").join("b").with_extension("txt").display());
+    println!("{}", p.to_str().is_some());
+}
+```
 
-    // Errors carry a kind
+```text output
+"archive.tar.gz" "gz" "/tmp"
+a/b.txt
+true
+```
+
+## Errors carry a `kind`
+
+`NotFound` is the kind for a missing path. Match on `kind` when you care
+which failure it was, and keep the full error when you only need to report
+it.
+
+```rust file=n10.rs
+use std::env;
+use std::fs;
+
+fn main() -> std::io::Result<()> {
+    let dir = env::temp_dir().join(format!("rust_by_example_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
     let err = fs::read_to_string(dir.join("nope")).unwrap_err();
     println!("{:?}", err.kind());
-
-    // Anything implementing Write: here an in-memory buffer
-    let mut mem = Cursor::new(Vec::new());
-    write!(mem, "hello {}", 5)?;
-    println!("{}", String::from_utf8(mem.into_inner()).unwrap());
-
-    // Running a process (no shell, so no injection)
-    let out = Command::new("echo").arg("42").output()?;
-    println!("{}", String::from_utf8_lossy(&out.stdout).trim());
-
-    println!("{}", env::var("DEFINITELY_NOT_SET").unwrap_or_else(|_| "default".to_string()));
-
     fs::remove_dir_all(&dir)?;
     println!("{}", dir.exists());
     Ok(())
@@ -115,42 +313,56 @@ fn main() -> io::Result<()> {
 ```
 
 ```text output
-["alpha", "beta", "gamma"]
-1 alpha
-2 beta
-3 gamma
-4
-[0, 1, 2, 255] 4
-"line 0\nline 1\nline 2\n"
-beta
-91
-["data.bin", "notes.txt", "out.txt", "people.csv", "sub/x.rs"]
-"archive.tar.gz" "gz" "/tmp"
-a/b.txt
 NotFound
-hello 5
-42
-default
 false
 ```
 
-## Details that bite
+## Anything that implements `Write` can be the destination
 
-- Unbuffered `File` reads and writes are one syscall each. Wrap in
-  `BufReader` / `BufWriter` for line-oriented or many small operations.
-- `BufWriter` flushes on drop but **ignores errors there**; call
-  `flush()?` when correctness matters.
-- `read_to_string` fails on invalid UTF-8; use `fs::read` plus
-  `String::from_utf8_lossy` for arbitrary bytes.
-- `Path`/`PathBuf` are not guaranteed UTF-8; `to_str()` returns an
-  `Option`. Use `Path::join`, never string concatenation.
-- `fs::read_dir` order is arbitrary. Sort if you need determinism.
-- `std::fs` has no atomic replace by itself: write to a temp file in the
-  same directory and `fs::rename` over the target.
-- `env::args()` yields program arguments; for real CLIs use the `clap`
-  crate. `env::var` returns `Err` for unset *and* for non-UTF-8 values.
-- Remember `main` can return `io::Result<()>`; a returned `Err` prints a
-  debug message and exits non-zero.
+`Cursor<Vec<u8>>` is an in-memory file. The same `write!` macro targets a
+socket or a `File`.
+
+```rust file=n11.rs
+use std::io::{Cursor, Write};
+
+fn main() -> std::io::Result<()> {
+    let mut mem = Cursor::new(Vec::new());
+    write!(mem, "hello {}", 5)?;
+    println!("{}", String::from_utf8(mem.into_inner()).unwrap());
+    Ok(())
+}
+```
+
+```text output
+hello 5
+```
+
+## A process is not a shell
+
+`Command` runs `echo` directly, with a separate argument, so nothing is
+parsed as a shell command. `env::args` yields the program name and then the
+arguments; this binary is started with none, so the length is 1. `env::var`
+is `Err` both when the variable is unset and when its bytes are not UTF-8.
+For a real command-line parser, use the `clap` crate.
+
+```rust file=n12.rs
+use std::env;
+use std::process::Command;
+
+fn main() -> std::io::Result<()> {
+    let out = Command::new("echo").arg("42").output()?;
+    println!("{}", String::from_utf8_lossy(&out.stdout).trim());
+    println!("{}", env::args().len());
+    println!("{}", env::var("DEFINITELY_NOT_SET").unwrap_or_else(|_| "default".into()));
+    Ok(())
+}
+```
+
+```text output
+42
+1
+default
+```
 
 ## Exercises
 

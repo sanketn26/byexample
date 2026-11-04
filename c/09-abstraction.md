@@ -1,26 +1,51 @@
 # C 09 — Abstraction: Function Pointers, Callbacks and Vtables
 
-C has no classes or interfaces, but function pointers plus structs give you
-callbacks, polymorphism and information hiding — the same mechanics that
-other languages generate for you.
+C has no classes or interfaces. Function pointers plus structs are the
+callbacks, the polymorphism, and the information hiding that other
+languages generate for you.
 
-## Example
+Function-pointer syntax is hostile. Read it inside out, and give it a
+`typedef`: `typedef int (*binop)(int, int);`. The types must match
+exactly. Casting to an incompatible signature and calling through it is
+undefined. Calling a `NULL` function pointer crashes; check a vtable
+when you build the object.
 
-```c file=example.c
-#include <stddef.h>
+## A function pointer is a value
+
+The array holds `add` and `mul`. Calling through the pointer is an
+ordinary call.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-/* 1. Function pointers */
 typedef int (*binop)(int, int);
 
 static int add(int a, int b) { return a + b; }
 static int mul(int a, int b) { return a * b; }
 
-/* 2. Callback + user context (the C substitute for closures) */
-static void for_each(const int *a, size_t n, void (*fn)(int, void *), void *ctx) {
-    for (size_t i = 0; i < n; i++) {
+int main(void) {
+    binop ops[] = {add, mul};
+    printf("%d %d\n", ops[0](3, 4), ops[1](3, 4));
+    return 0;
+}
+```
+
+```text output
+7 12
+```
+
+## A callback takes a context pointer
+
+There are no closures. Without a `void *ctx`, the only way to carry
+state is a global. The accumulator lives in the caller; the callback
+adds into it. `void *` erases the type, so document what it points at
+and keep the cast in one place.
+
+```c file=n02.c
+#include <stdio.h>
+
+static void for_each(const int *a, int n, void (*fn)(int, void *), void *ctx) {
+    for (int i = 0; i < n; i++) {
         fn(a[i], ctx);
     }
 }
@@ -29,7 +54,29 @@ static void accumulate(int v, void *ctx) {
     *(int *)ctx += v;
 }
 
-/* 3. Polymorphism: an ops table ("vtable") embedded via the first member */
+int main(void) {
+    int data[] = {1, 2, 3, 4};
+    int total = 0;
+    for_each(data, 4, accumulate, &total);
+    printf("%d\n", total);
+    return 0;
+}
+```
+
+```text output
+10
+```
+
+## The first member is the base
+
+A `struct circle *` may be cast to `struct shape *` because `base` is
+the first member and the object really is a `struct circle`. The ops
+table is the vtable: one `area` function and a name, shared by every
+circle.
+
+```c file=n03.c
+#include <stdio.h>
+
 struct shape;
 
 struct shape_ops {
@@ -42,7 +89,7 @@ struct shape {
 };
 
 struct circle {
-    struct shape base; /* must be first so a pointer cast is valid */
+    struct shape base;
     double r;
 };
 
@@ -68,8 +115,32 @@ static void describe(const struct shape *s) {
     printf("%s %.2f\n", s->ops->name, s->ops->area(s));
 }
 
-/* 4. Opaque type: callers see only the API (imagine this struct body lives
-      in the .c file and the header exposes `struct counter;`) */
+int main(void) {
+    struct circle c = {{&circle_ops}, 1.0};
+    struct square q = {{&square_ops}, 2.0};
+    const struct shape *shapes[] = {&c.base, &q.base};
+    describe(shapes[0]);
+    describe(shapes[1]);
+    return 0;
+}
+```
+
+```text output
+circle 3.14
+square 4.00
+```
+
+## An opaque type hides the fields
+
+Callers need only the functions. In a real split, the struct body lives
+in the `.c` file and the header says `struct counter;`. That is C's
+encapsulation. The cost is a heap allocation, or accessor calls, instead
+of reading the fields directly.
+
+```c file=n04.c
+#include <stdio.h>
+#include <stdlib.h>
+
 struct counter {
     int n;
 };
@@ -77,15 +148,64 @@ struct counter {
 static struct counter *counter_new(void) {
     return calloc(1, sizeof(struct counter));
 }
+
 static void counter_inc(struct counter *c) { c->n++; }
+
 static int counter_get(const struct counter *c) { return c->n; }
+
 static void counter_free(struct counter *c) { free(c); }
 
-/* 5. Type-generic selection with C11 _Generic */
+int main(void) {
+    struct counter *ctr = counter_new();
+    if (!ctr) {
+        return 1;
+    }
+    counter_inc(ctr);
+    counter_inc(ctr);
+    counter_inc(ctr);
+    printf("%d\n", counter_get(ctr));
+    counter_free(ctr);
+    return 0;
+}
+```
+
+```text output
+3
+```
+
+## _Generic selects on the static type
+
+The association is chosen at compile time. It does not look at the
+value. A character constant such as `'c'` has type `int` in C, so the
+last item matches `int`, not a character type.
+
+```c file=n05.c
+#include <stdio.h>
+
 #define TYPE_NAME(x) \
     _Generic((x), int: "int", double: "double", char *: "char*", default: "other")
 
-/* 6. A generic container using void * and an element size */
+int main(void) {
+    printf("%s %s %s %s\n", TYPE_NAME(1), TYPE_NAME(1.5), TYPE_NAME("s"),
+           TYPE_NAME('c'));
+    return 0;
+}
+```
+
+```text output
+int double char* int
+```
+
+## A size plus void * is a generic stack
+
+The container stores bytes. The caller passes the element size and is
+responsible for the real type. Pop copies the bytes back out.
+
+```c file=n06.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 struct gstack {
     unsigned char *data;
     size_t elem, len, cap;
@@ -112,35 +232,12 @@ static void gstack_pop(struct gstack *s, void *out) {
 }
 
 int main(void) {
-    binop ops[] = {add, mul};
-    printf("%d %d\n", ops[0](3, 4), ops[1](3, 4));
-
-    int data[] = {1, 2, 3, 4};
-    int total = 0;
-    for_each(data, 4, accumulate, &total);
-    printf("%d\n", total);
-
-    struct circle c = {{&circle_ops}, 1.0};
-    struct square q = {{&square_ops}, 2.0};
-    const struct shape *shapes[] = {&c.base, &q.base};
-    for (size_t i = 0; i < 2; i++) {
-        describe(shapes[i]);
-    }
-
-    struct counter *ctr = counter_new();
-    counter_inc(ctr);
-    counter_inc(ctr);
-    counter_inc(ctr);
-    printf("%d\n", counter_get(ctr));
-    counter_free(ctr);
-
-    printf("%s %s %s %s\n", TYPE_NAME(1), TYPE_NAME(1.5), TYPE_NAME("s"),
-           TYPE_NAME('c'));
-
     struct gstack st = {.elem = sizeof(double)};
     double vals[] = {1.5, 2.5, 3.5};
-    for (size_t i = 0; i < 3; i++) {
-        gstack_push(&st, &vals[i]);
+    for (int i = 0; i < 3; i++) {
+        if (gstack_push(&st, &vals[i]) != 0) {
+            return 1;
+        }
     }
     double a, b;
     gstack_pop(&st, &a);
@@ -152,34 +249,9 @@ int main(void) {
 ```
 
 ```text output
-7 12
-10
-circle 3.14
-square 4.00
-3
-int double char* int
 3.5 2.5
 ```
 
-## Details that bite
-
-- The syntax of function-pointer declarations is hostile: use a
-  `typedef` (`typedef int (*binop)(int, int);`). Read declarations
-  inside-out.
-- A callback with no user-data parameter cannot carry state without
-  globals. Always offer `void *ctx` in your own callback APIs.
-- `void *` erases types completely; the compiler cannot help. Document
-  the expected type and size, and keep the casts in one place.
-- Casting `struct shape *` to `struct circle *` is valid only because
-  `base` is the *first* member and the object really is a `struct circle`.
-- `_Generic` selects on the *static* type; note `'c'` is an `int` in C,
-  which is why the last item printed `int`.
-- Function pointer types must match exactly; casting between incompatible
-  signatures and calling is undefined behaviour.
-- Calling through a `NULL` function pointer crashes. Validate vtables
-  during construction.
-- Hiding struct bodies from callers (opaque types) is how C does
-  encapsulation, at the price of heap allocation or accessor calls.
 
 ## Exercises
 

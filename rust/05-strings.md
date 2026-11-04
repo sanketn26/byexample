@@ -1,74 +1,24 @@
 # Rust 05 — Strings
 
-Two main string types: `String` (owned, growable) and `&str` (a borrowed
-view). Both are always valid UTF-8, so byte length, `char` count and
-"visible characters" are three different things.
+`String` owns its bytes and can grow. `&str` borrows some of those bytes.
+Both are valid UTF-8. Byte length, the number of `char`s, and what a person
+sees as one character are three different counts.
 
-## Example
+## Bytes and `char`s are different lengths
 
-```rust file=example.rs
-fn shout(s: &str) -> String {
-    s.to_uppercase() + "!"
-}
+`len` counts bytes. `chars` counts Unicode scalar values. `s[i]` does not
+exist, because a byte offset can land inside a character. Use `chars`,
+`char_indices`, or a slice you already know is on a boundary. Grapheme
+clusters (what a reader calls one character) need the `unicode-segmentation`
+crate. `chars` stops at code points.
 
+```rust file=n01.rs
 fn main() {
     let s = String::from("héllo, 世界");
-    println!("{} {}", s.len(), s.chars().count()); // bytes vs chars
+    println!("{} {}", s.len(), s.chars().count());
     println!("{} {:?}", &s[0..1], s.char_indices().nth(2));
     println!("{:?}", s.chars().rev().collect::<String>());
     println!("{}", s.to_uppercase());
-
-    // Building
-    let mut t = String::new();
-    t.push_str("ab");
-    t.push('c');
-    t += "de";
-    t.insert(0, '>');
-    println!("{t} {}", t.len());
-
-    // Splitting and trimming
-    println!(
-        "{:?} {:?}",
-        "a,b,,c".split(',').collect::<Vec<_>>(),
-        "  x y  ".split_whitespace().collect::<Vec<_>>()
-    );
-    println!("{:?} {:?}", "key=value".split_once('='), "novalue".split_once('='));
-    println!("{} {} {}", "  pad ".trim(), "xxhixx".trim_matches('x'), "Hello".replace('l', "L"));
-    println!("{:?} {:?}", "hello".find("ll"), "hello".find('z'));
-    println!("{} {}", "abc" < "abd", "Zebra".to_lowercase() == "zebra");
-
-    let words = vec!["a", "b", "c"];
-    println!("{}", words.join("-"));
-
-    // Parsing
-    println!("{:?}", "42".parse::<i32>());
-    println!("{}", "4x".parse::<i32>().is_err());
-
-    // Slicing mid-character would panic; `get` returns None instead
-    println!("{:?} {:?}", s.get(1..2), s.get(1..3));
-
-    // Bytes and UTF-8 validation
-    println!("{:?}", "hi".bytes().collect::<Vec<u8>>());
-    println!("{}", String::from_utf8(vec![104, 105]).unwrap());
-    println!("{}", String::from_utf8(vec![0xff]).is_err());
-
-    // format!
-    let name = "Ada";
-    let msg = format!("{name:>6}|{:<6}|{:^6}|", "x", "y");
-    println!("{msg}");
-
-    // chars
-    println!(
-        "{} {} {:?} {}",
-        'a'.is_alphabetic(),
-        '9'.to_digit(10).unwrap(),
-        'ß'.to_uppercase().collect::<String>(),
-        (b'a' + 2) as char
-    );
-
-    // &String coerces to &str, so take &str in parameters
-    let owned = String::from("hey");
-    println!("{} {}", shout(&owned), shout("lit"));
 }
 ```
 
@@ -77,41 +27,192 @@ fn main() {
 h Some((3, 'l'))
 "界世 ,olléh"
 HÉLLO, 世界
+```
+
+## Slicing off a boundary panics
+
+`&s[a..b]` panics when `a` or `b` is inside a character. `get` returns
+`None` for the same range, so the caller can decide.
+
+```rust file=n02.rs
+fn main() {
+    let s = String::from("héllo, 世界");
+    println!("{:?} {:?}", s.get(1..2), s.get(1..3));
+}
+```
+
+```text output
+None Some("é")
+```
+
+## `String` grows in place
+
+`push_str` and `push` borrow the buffer. `+` is different: `String + &str`
+**moves** the left-hand `String`, so that name is gone. Use `format!` when
+every piece must stay usable. Return a `String` when you build new text,
+and take `&str` in parameters so both `String` and literals work.
+`&String` coerces to `&str`.
+
+```rust file=n03.rs
+fn shout(s: &str) -> String {
+    s.to_uppercase() + "!"
+}
+
+fn main() {
+    let mut t = String::new();
+    t.push_str("ab");
+    t.push('c');
+    t += "de";
+    t.insert(0, '>');
+    println!("{t} {}", t.len());
+
+    let a = String::from("ab");
+    let b = String::from("cd");
+    let c = a + &b;
+    println!("{c} {b}");
+
+    let owned = String::from("hey");
+    println!("{} {}", shout(&owned), shout("lit"));
+}
+```
+
+```text output
 >abcde 6
+abcd cd
+HEY! LIT!
+```
+
+## Split, trim, and search borrow the original
+
+`split` keeps the empty pieces between separators. `split_whitespace`
+does not. `split_once` stops at the first match. `find` returns a byte
+index, or `None`.
+
+```rust file=n04.rs
+fn main() {
+    println!(
+        "{:?} {:?}",
+        "a,b,,c".split(',').collect::<Vec<_>>(),
+        "  x y  ".split_whitespace().collect::<Vec<_>>()
+    );
+    println!(
+        "{:?} {:?}",
+        "key=value".split_once('='),
+        "novalue".split_once('=')
+    );
+    println!(
+        "{} {} {}",
+        "  pad ".trim(),
+        "xxhixx".trim_matches('x'),
+        "Hello".replace('l', "L")
+    );
+    println!("{:?} {:?}", "hello".find("ll"), "hello".find('z'));
+}
+```
+
+```text output
 ["a", "b", "", "c"] ["x", "y"]
 Some(("key", "value")) None
 pad hi HeLLo
 Some(2) None
+```
+
+## Ordering is by bytes, not by locale
+
+`"abc" < "abd"` compares UTF-8 bytes. `to_lowercase` is Unicode-aware, but
+it is not a full case-fold, and it does not make sort order match a
+dictionary. `join` inserts the separator between borrowed pieces.
+
+```rust file=n05.rs
+fn main() {
+    println!("{} {}", "abc" < "abd", "Zebra".to_lowercase() == "zebra");
+    let words = vec!["a", "b", "c"];
+    println!("{}", words.join("-"));
+}
+```
+
+```text output
 true true
 a-b-c
+```
+
+## Parsing a number is a `Result`
+
+The turbofish `parse::<i32>` picks the target type when inference cannot.
+Failure is `Err`, not a panic.
+
+```rust file=n06.rs
+fn main() {
+    println!("{:?}", "42".parse::<i32>());
+    println!("{}", "4x".parse::<i32>().is_err());
+}
+```
+
+```text output
 Ok(42)
 true
-None Some("é")
+```
+
+## Invalid UTF-8 is an error, or a replacement
+
+`String::from_utf8` refuses a bad byte. `from_utf8_lossy` substitutes `�`
+and always returns a string. File names are not promised to be UTF-8;
+`OsString` and `Path` hold those bytes (lesson 10).
+
+```rust file=n07.rs
+fn main() {
+    println!("{:?}", "hi".bytes().collect::<Vec<u8>>());
+    println!("{}", String::from_utf8(vec![104, 105]).unwrap());
+    println!("{}", String::from_utf8(vec![0xff]).is_err());
+    println!("{}", String::from_utf8_lossy(&[0xff]));
+}
+```
+
+```text output
 [104, 105]
 hi
 true
-   Ada|x     |  y   |
-true 9 "SS" c
-HEY! LIT!
+�
 ```
 
-## Details that bite
+## `format!` builds a `String`
 
-- `s[i]` does not exist: strings are not indexable by integer because a
-  byte offset may land inside a character. Use `.chars().nth(i)`,
-  `.char_indices()`, or byte slicing on known boundaries.
-- Slicing `&s[a..b]` panics if `a` or `b` is not a character boundary.
-  `s.get(a..b)` returns `None` instead.
-- `String + &str` moves the left side: `let c = a + &b;` makes `a`
-  unusable. Use `format!` when you want to keep everything.
-- Comparing/sorting is by bytes, not by locale; `to_lowercase()` is
-  Unicode-aware but not a full case-fold.
-- "User-perceived characters" (grapheme clusters) need the
-  `unicode-segmentation` crate; `chars()` yields code points.
-- `String::from_utf8_lossy` replaces invalid sequences with `�`;
-  `OsString`/`Path` exist for non-UTF-8 file names.
-- Function parameters should usually be `&str`; return `String` when you
-  produce new text.
+The same format specs as `println!` work here. Nothing is written to the
+terminal until you print the result.
+
+```rust file=n08.rs
+fn main() {
+    let name = "Ada";
+    let msg = format!("{name:>6}|{:<6}|{:^6}|", "x", "y");
+    println!("{msg}");
+}
+```
+
+```text output
+   Ada|x     |  y   |
+```
+
+## A `char` is not a byte
+
+`to_digit` parses one character in a radix. `to_uppercase` can yield more
+than one `char`: `ß` becomes `SS`. Adding to a byte and casting with `as`
+is only safe inside ASCII.
+
+```rust file=n09.rs
+fn main() {
+    println!(
+        "{} {} {:?} {}",
+        'a'.is_alphabetic(),
+        '9'.to_digit(10).unwrap(),
+        'ß'.to_uppercase().collect::<String>(),
+        (b'a' + 2) as char
+    );
+}
+```
+
+```text output
+true 9 "SS" c
+```
 
 ## Exercises
 

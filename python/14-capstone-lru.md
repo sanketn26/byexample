@@ -1,31 +1,95 @@
 # Python 14 — Capstone: an LRU Cache
 
-A *least-recently-used* cache keeps the N most recently touched entries and
-evicts the stalest. It exercises classes, dunder methods, error handling and
-a data-structure choice: here `OrderedDict` gives O(1) reorder and evict.
-(The same capstone appears in every language in this course; compare how the
-data structure changes.)
+A least-recently-used cache keeps the N most recently touched entries and
+evicts the stalest. Lookup and "move to newest" both have to be O(1). A
+hash map plus a doubly linked list is the classic pair. `OrderedDict` is
+that pair already.
 
-## Example
+## `OrderedDict` moves a key and drops the oldest
 
-```python file=example.py
-import functools
+`move_to_end` is the "just used" operation. `popitem(last=False)` evicts
+the other end. Both are O(1).
+
+```python file=n01.py
+from collections import OrderedDict
+
+data = OrderedDict()
+data["a"] = 1
+data["b"] = 2
+data.move_to_end("a")
+print(list(data))
+print(data.popitem(last=False))
+print(list(data))
+```
+
+```text output
+['b', 'a']
+('b', 2)
+['a']
+```
+
+## `get` makes the key newest
+
+A hit moves the key to the end. A miss returns the default and does not
+insert anything. The key list below is newest first.
+
+```python file=n02.py
 from collections import OrderedDict
 
 
 class LRUCache:
-    """Maps keys to values, evicting the least recently used when full."""
-
     def __init__(self, capacity):
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
         self.capacity = capacity
-        self._data = OrderedDict()          # oldest first, newest last
+        self._data = OrderedDict()
 
     def get(self, key, default=None):
         if key not in self._data:
             return default
-        self._data.move_to_end(key)         # touching makes it newest
+
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value):
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+
+    def keys(self):
+        return list(reversed(self._data))
+
+
+c = LRUCache(2)
+c.put("a", 1)
+c.put("b", 2)
+print(c.keys(), c.get("missing"))
+print(c.get("a"))
+print(c.keys())
+```
+
+```text output
+['b', 'a'] None
+1
+['a', 'b']
+```
+
+## A full `put` evicts the least recently used
+
+After `get("a")`, `b` is the oldest. The next new key drops `b`. Putting
+a key that is already present refreshes it instead of growing the cache.
+
+```python file=n03.py
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._data:
+            return default
+        self._data.move_to_end(key)
         return self._data[key]
 
     def put(self, key, value):
@@ -33,13 +97,192 @@ class LRUCache:
             self._data.move_to_end(key)
         self._data[key] = value
         if len(self._data) > self.capacity:
-            self._data.popitem(last=False)  # evict the oldest
+            self._data.popitem(last=False)
 
     def keys(self):
-        """Keys from most to least recently used."""
         return list(reversed(self._data))
 
-    def __contains__(self, key):            # does NOT count as a use
+
+c = LRUCache(2)
+c.put("a", 1)
+c.put("b", 2)
+c.get("a")
+c.put("c", 3)
+print(c.get("b"), c.keys())
+c.put("a", 10)
+print(c.get("a"), c.keys())
+```
+
+```text output
+None ['c', 'a']
+10 ['a', 'c']
+```
+
+## `in` does not count as a use
+
+Membership answers "is it stored?" and leaves the order alone. A `peek`
+should do the same. Most caches treat only `get` and `put` as a use.
+
+```python file=n04.py
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self):
+        self._data = OrderedDict()
+
+    def put(self, key, value):
+        self._data[key] = value
+
+    def keys(self):
+        return list(reversed(self._data))
+
+    def __contains__(self, key):
+        return key in self._data
+
+
+c = LRUCache()
+c.put("a", 1)
+c.put("b", 2)
+print("a" in c, c.keys())
+```
+
+```text output
+True ['b', 'a']
+```
+
+## Capacity has to be positive
+
+Zero would evict every insert, and a negative size is meaningless. Raise
+`ValueError` before building the map.
+
+```python file=n05.py
+def check(capacity):
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+
+
+try:
+    check(0)
+except ValueError as e:
+    print("error:", e)
+```
+
+```text output
+error: capacity must be positive
+```
+
+## The key has to be hashable
+
+The map is a dict. A list or a dict as a key raises `TypeError`. The
+caller converts those to tuples.
+
+```python file=n06.py
+from collections import OrderedDict
+
+data = OrderedDict()
+try:
+    data[["a"]] = 1
+except TypeError as e:
+    print(type(e).__name__)
+data[("a",)] = 1
+print(data[("a",)])
+```
+
+```text output
+TypeError
+1
+```
+
+## The cache keeps the value alive
+
+A stored value stays reachable until it is evicted or replaced. That is
+what you want for a normal cache, and it is a leak when the value is
+huge. `weakref.WeakValueDictionary` is the version that does not keep it.
+
+```python file=n07.py
+import weakref
+
+
+class Box:
+    pass
+
+
+box = Box()
+held = box
+probe = weakref.ref(box)
+del box
+print(probe() is held)
+del held
+print(probe() is None)
+```
+
+```text output
+True
+True
+```
+
+## `lru_cache` is the same policy for functions
+
+`maxsize` is the capacity. `cache_info` reports hits, misses, and how
+many entries are stored. This decorator is safe to call from several
+threads. A hand-rolled `OrderedDict` cache is not: `get` is several
+steps, so share it only under a lock.
+
+```python file=n08.py
+import functools
+
+
+@functools.lru_cache(maxsize=2)
+def square(n):
+    return n * n
+
+
+square(1)
+square(2)
+square(1)
+square(3)
+print(square.cache_info())
+```
+
+```text output
+CacheInfo(hits=1, misses=3, maxsize=2, currsize=2)
+```
+
+## The pieces are one cache
+
+`get` refreshes, `put` evicts the oldest when the dict grows past
+capacity, and `in` still does not refresh. The repr shows oldest first,
+because that is `OrderedDict`'s order.
+
+```python file=n09.py
+from collections import OrderedDict
+
+
+class LRUCache:
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._data = OrderedDict()
+
+    def get(self, key, default=None):
+        if key not in self._data:
+            return default
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key, value):
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        if len(self._data) > self.capacity:
+            self._data.popitem(last=False)
+
+    def keys(self):
+        return list(reversed(self._data))
+
+    def __contains__(self, key):
         return key in self._data
 
     def __len__(self):
@@ -52,25 +295,12 @@ class LRUCache:
 c = LRUCache(2)
 c.put("a", 1)
 c.put("b", 2)
-print(c.get("a"))        # a becomes the newest
-c.put("c", 3)            # evicts b, the least recently used
+print(c.get("a"))
+c.put("c", 3)
 print(c.get("b"))
 print(c.keys())
 print("a" in c, len(c))
 print(c)
-
-try:
-    LRUCache(0)
-except ValueError as e:
-    print("error:", e)
-
-# The standard library already ships one for function results
-@functools.lru_cache(maxsize=2)
-def square(n):
-    return n * n
-
-square(1); square(2); square(1); square(3)   # 3 evicts 2
-print(square.cache_info())
 ```
 
 ```text output
@@ -79,22 +309,7 @@ None
 ['c', 'a']
 True 2
 LRUCache({'a': 1, 'c': 3}, capacity=2)
-error: capacity must be positive
-CacheInfo(hits=1, misses=3, maxsize=2, currsize=2)
 ```
-
-## Details that bite
-
-- Two O(1) operations are needed: lookup by key and "move to newest".
-  Hash map + doubly linked list is the classic answer; `OrderedDict`
-  already is one.
-- Decide whether `in` and `peek` count as a use. Most caches say no.
-- Caches hold references: values stay alive until evicted. Use
-  `weakref.WeakValueDictionary` if that is not what you want.
-- A cache shared between threads needs a lock; `lru_cache` is
-  thread-safe, `OrderedDict` operations are not atomic as a group.
-- Unhashable keys (lists, dicts) raise `TypeError`; the caller must
-  convert to tuples.
 
 ## Exercises
 

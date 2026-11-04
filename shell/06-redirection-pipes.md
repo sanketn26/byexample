@@ -1,130 +1,275 @@
 # Shell 06 — Redirection and Pipes
 
-Every process starts with three **file descriptors**: `0` stdin, `1` stdout,
-`2` stderr. Redirection rewires them *before* the command runs; pipes
-connect one command's stdout to the next one's stdin. This is the heart of
-the Unix philosophy: small tools, one text stream.
+Every process starts with three file descriptors: `0` stdin, `1`
+stdout, `2` stderr. Redirection rewires them before the command runs.
+A pipe connects one command's stdout to the next command's stdin.
 
-## Example
+## `>` truncates, `>>` appends, `<` reads
 
-```bash file=example.sh
-#!/usr/bin/env bash
+`cat file | cmd` is usually an extra process. `cmd < file` does the
+same read and leaves `$?` as that command's status.
+
+```bash file=n01.sh
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
-
-# > truncates, >> appends, < reads
 echo "one" > log.txt
 echo "two" >> log.txt
-wc -l < log.txt
+echo "$(( $(wc -l < log.txt) ))"
+```
 
-# stdout and stderr are separate streams
+```text output
+2
+```
+
+## Stdout and stderr are different streams
+
+`2>/dev/null` drops stderr. `>/dev/null` drops stdout. `>file 2>&1`
+sends both to the file. `&>file` is bash shorthand for that form, and
+it is not POSIX.
+
+```bash file=n02.sh
 noisy() { echo "to-out"; echo "to-err" >&2; }
-noisy 2>/dev/null                  # discard stderr
-noisy >/dev/null                   # discard stdout (stderr still shows)
-noisy >both.txt 2>&1               # both into a file
-sort both.txt
+noisy 2>/dev/null
+noisy >/dev/null
+tmp=$(mktemp -d)
+noisy >"$tmp/both.txt" 2>&1
+sort "$tmp/both.txt"
+```
 
-# ORDER MATTERS: redirections apply left to right
-noisy 2>&1 >/dev/null              # stderr -> where stdout WAS (the terminal)
+```text output
+to-out
+to-err
+to-err
+to-out
+```
 
-# Capture only stderr of a command
+## Redirections apply left to right
+
+`cmd >file 2>&1` points stderr at the file. `cmd 2>&1 >file` points
+stderr at the old stdout, the terminal, and only then moves stdout
+to the file.
+
+```bash file=n03.sh
+noisy() { echo "to-out"; echo "to-err" >&2; }
+noisy 2>&1 >/dev/null
+```
+
+```text output
+to-err
+```
+
+## Swap the streams to capture stderr
+
+Point stderr at the current stdout, then point stdout at `/dev/null`.
+The substitution receives what used to be stderr.
+
+```bash file=n04.sh
+noisy() { echo "to-out"; echo "to-err" >&2; }
 errs=$(noisy 2>&1 >/dev/null)
 echo "captured: $errs"
+```
 
-# Pipes
+```text output
+captured: to-err
+```
+
+## A pipe feeds stdout to the next stdin
+
+Prefer `printf` for data in a pipe. `echo` mangles `-n`, `-e`, and
+backslashes in some shells.
+
+```bash file=n05.sh
 printf 'b\na\nc\na\n' | sort | uniq -c | sort -rn | head -2
+```
 
-# Here-doc and here-string feed stdin
+```text output
+   2 a
+   1 c
+```
+
+## Here-docs and here-strings are stdin
+
+`<<<` sends one string. `<<EOF` sends the following lines, up to a
+line that is only the delimiter. The delimiter in the script below is
+unquoted, but the body has nothing to expand.
+
+```bash file=n06.sh
 tr a-z A-Z <<< "shout"
-cat <<EOF | wc -w
+words=$(cat <<EOF | wc -w
 one two
 three
 EOF
+)
+echo "$((words))"
+```
 
-# tee splits a stream: save it AND keep passing it on
+```text output
+SHOUT
+3
+```
+
+## `tee` saves a copy and passes the stream on
+
+The file gets the same bytes the next command sees.
+
+```bash file=n07.sh
+tmp=$(mktemp -d)
+cd "$tmp"
 echo "payload" | tee copy.txt | tr a-z A-Z
 cat copy.txt
+```
 
-# Process substitution: a command's output as a "file"
+```text output
+PAYLOAD
+payload
+```
+
+## Process substitution is a command with a file name
+
+`<(...)` expands to a path the program can read. `diff` wants two
+files, not two pipes, so this is how both sides stay commands.
+
+```bash file=n08.sh
 diff <(echo a; echo b) <(echo a; echo c) | head -3
+```
 
-# Exit statuses in a pipeline: only the last, unless pipefail
-false | true;  echo "no pipefail: $?"
+```text output
+2c2
+< b
+---
+```
+
+## Without `pipefail`, only the last status counts
+
+`bad | tee log` looks successful because `tee` succeeded. `set -o
+pipefail` fails the pipeline if any stage fails. `PIPESTATUS` holds
+every stage's status from the pipeline just above it.
+
+```bash file=n09.sh
+false | true
+echo "no pipefail: $?"
 set -o pipefail
-false | true;  echo "pipefail:    $?"
+false | true
+echo "pipefail:    $?"
 set +o pipefail
-false | true | false | true; echo "PIPESTATUS: ${PIPESTATUS[*]}"
+false | true | false | true
+echo "PIPESTATUS: ${PIPESTATUS[*]}"
+```
 
-# Custom file descriptors
-exec 3> fd3.txt                    # open fd 3 for writing
+```text output
+no pipefail: 0
+pipefail:    1
+PIPESTATUS: 1 0 1 0
+```
+
+## A pipeline stage is a subshell
+
+The stages run at the same time. `echo hi | read x` leaves `x` unset
+in the current shell, because `read` assigned it in the other one.
+Lesson 08 shows how to keep the variable.
+
+```bash file=n10.sh
+x=unset
+echo hi | read -r x
+echo "after pipe: $x"
+```
+
+```text output
+after pipe: unset
+```
+
+## Extra descriptors leave stdin free
+
+`exec 3>file` opens descriptor 3 for the rest of the script. `>&3`
+writes there. `exec 3>&-` closes it. `read -u 4` reads that
+descriptor and does not touch stdin.
+
+```bash file=n11.sh
+tmp=$(mktemp -d)
+cd "$tmp"
+exec 3> fd3.txt
 echo "via fd 3" >&3
-exec 3>&-                          # close it
+exec 3>&-
 cat fd3.txt
-
-# Reading a file line by line with fd 4, keeping stdin free
 printf 'x\ny\n' > in.txt
 exec 4< in.txt
 while IFS= read -r -u 4 l; do echo "got $l"; done
 exec 4<&-
+```
 
-# noclobber refuses to overwrite with >; >| forces it
+```text output
+via fd 3
+got x
+got y
+```
+
+## `noclobber` refuses to truncate
+
+`set -o noclobber` makes `>` fail when the file exists. `>|` forces
+the truncation.
+
+```bash file=n12.sh
+tmp=$(mktemp -d)
+cd "$tmp"
+echo old > log.txt
 set -o noclobber
 ( echo new > log.txt ) 2>/dev/null || echo "noclobber blocked >"
 echo forced >| log.txt
-set +o noclobber
 cat log.txt
+```
 
-# Sending the same text to a command's stdin from a variable, no temp file
+```text output
+noclobber blocked >
+forced
+```
+
+## `>` creates the file before the command runs
+
+The file appears even when the command is not found or fails later.
+Check the status. Do not treat an empty file as proof the command
+worked.
+
+```bash file=n13.sh
+tmp=$(mktemp -d)
+cd "$tmp"
+missing-cmd > created.txt 2>/dev/null || true
+[[ -f created.txt ]] && echo "created"
+```
+
+```text output
+created
+```
+
+## Redirecting a file onto itself truncates it first
+
+`sort f > f` empties `f` before `sort` reads it. Write to a temp file
+and `mv`, or use `sponge` / `sed -i`.
+
+```bash file=n14.sh
+tmp=$(mktemp -d)
+cd "$tmp"
+printf 'b\na\n' > f
+sort f > f
+echo "left [$(cat f)]"
+```
+
+```text output
+left []
+```
+
+## A here-string sends a variable, not a temp file
+
+`<<< "$data"` is stdin for one command. No file is left behind.
+
+```bash file=n15.sh
 data=$'line1\nline2'
 grep -c line <<< "$data"
 ```
 
 ```text output
 2
-to-out
-to-err
-to-err
-to-out
-to-err
-captured: to-err
-      2 a
-      1 c
-SHOUT
-3
-PAYLOAD
-payload
-2c2
-< b
----
-no pipefail: 0
-pipefail:    1
-PIPESTATUS: 1 0 1 0
-via fd 3
-got x
-got y
-noclobber blocked >
-forced
-2
 ```
-
-## Details that bite
-
-- `cmd > file 2>&1` sends both to the file. `cmd 2>&1 > file` does not:
-  stderr was pointed at the *old* stdout (the terminal) first.
-- `cmd &> file` is bash shorthand for the first form. Not POSIX.
-- `cat file | cmd` is usually unnecessary: `cmd < file` saves a process
-  (and keeps `$?` meaningful).
-- Redirecting a file onto itself (`sort f > f`, `sed ... f > f`)
-  truncates the input before it is read. Write to a temp file and `mv`,
-  or use `sponge` / `sed -i`.
-- Without `pipefail`, `bad_command | tee log` reports success because
-  `tee` succeeded.
-- A pipeline's stages run **concurrently**, each in its own subshell, which
-  is why `echo hi | read x` leaves `x` unset (lesson 08).
-- `>` creates the file even if the command then fails or is not found.
-- Prefer `printf` over `echo` for piping data: `echo` mangles `-n`, `-e`
-  and backslashes in some shells.
 
 ## Exercises
 

@@ -1,46 +1,28 @@
 # Go 11 — Concurrency
 
-Goroutines are cheap, channels move data between them, and `sync` / `atomic`
-protect shared state. Go's motto: *share memory by communicating*.
+Goroutines are cheap, channels move data between them, and `sync` or
+`atomic` protects shared state. Share memory by communicating. Run
+`go test -race` (or `go run -race`); the race detector finds unsynchronised
+access that a lucky schedule hides. `main` returning ends the process even
+if other goroutines are still running. If every goroutine is blocked, the
+runtime aborts with `fatal error: all goroutines are asleep - deadlock!`.
 
-## Example
+## `WaitGroup` waits, and the index needs no lock
 
-```go file=example.go
+`Add` happens before `go`, never inside the goroutine. Each iteration owns
+its `i` (Go 1.22), and each goroutine writes a different index, so no mutex
+is required. A goroutine blocked on a channel nobody uses leaks; give it a
+`context`, a done channel, or a closed input.
+
+```go file=n01.go
 package main
 
 import (
-	"context"
 	"fmt"
-	"sort"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-func gen(nums ...int) <-chan int {
-	out := make(chan int)
-	go func() {
-		defer close(out) // the sender closes
-		for _, n := range nums {
-			out <- n
-		}
-	}()
-	return out
-}
-
-func square(in <-chan int) <-chan int {
-	out := make(chan int)
-	go func() {
-		defer close(out)
-		for n := range in {
-			out <- n * n
-		}
-	}()
-	return out
-}
-
 func main() {
-	// WaitGroup + writing to distinct slice indexes needs no lock
 	var wg sync.WaitGroup
 	results := make([]int, 5)
 	for i := range 5 {
@@ -52,13 +34,46 @@ func main() {
 	}
 	wg.Wait()
 	fmt.Println(results)
+}
+```
 
-	// Unbuffered channel: send and receive rendezvous
+```text output
+[0 1 4 9 16]
+```
+
+## An unbuffered send waits for a receiver
+
+The send and the receive meet. Nobody proceeds until the other side is
+there. Buffer the channel when the sender should not wait.
+
+```go file=n02.go
+package main
+
+import "fmt"
+
+func main() {
 	ch := make(chan string)
 	go func() { ch <- "ping" }()
 	fmt.Println(<-ch)
+}
+```
 
-	// Buffered channel, close, range
+```text output
+ping
+```
+
+## Only the sender closes a channel
+
+`range` stops at the close. A receive on a closed, empty channel returns
+the zero value and `false` immediately. Sending on a closed channel
+panics. Receiving from a closed one does not.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
+func main() {
 	jobs := make(chan int, 3)
 	for i := 1; i <= 3; i++ {
 		jobs <- i
@@ -68,10 +83,31 @@ func main() {
 	for j := range jobs {
 		sum += j
 	}
-	v, ok := <-jobs // receiving from a closed, drained channel
+	v, ok := <-jobs
 	fmt.Println(sum, v, ok)
+}
+```
 
-	// Worker pool
+```text output
+6 0 false
+```
+
+## A pool of workers shares one jobs channel
+
+Three goroutines range the input. A fourth closes the output after
+`Wait`, which is safe only because the workers have finished sending.
+Completion order is not deterministic, so sort before printing.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
+
+func main() {
 	in := make(chan int)
 	out := make(chan int)
 	var pool sync.WaitGroup
@@ -95,10 +131,31 @@ func main() {
 	for r := range out {
 		got = append(got, r)
 	}
-	sort.Ints(got) // completion order is not deterministic
+	sort.Ints(got)
 	fmt.Println(got)
+}
+```
 
-	// Mutex-protected counter and an atomic one
+```text output
+[10 20 30 40 50 60]
+```
+
+## A mutex or an atomic guards a shared counter
+
+Prefer a mutex when the state is a structure, and a channel when you are
+handing off ownership or a signal. `atomic.Int64` is enough for this
+counter. One hundred goroutines each add one hundred.
+
+```go file=n05.go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
 	var mu sync.Mutex
 	var atom atomic.Int64
 	counter := 0
@@ -117,8 +174,27 @@ func main() {
 	}
 	cw.Wait()
 	fmt.Println(counter, atom.Load())
+}
+```
 
-	// select with a timeout
+```text output
+10000 10000
+```
+
+## `select` waits for the first ready case
+
+`time.After` fires when nothing arrives in time. A `default` arm makes the
+same select non-blocking: it runs when no other case is ready.
+
+```go file=n06.go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
 	quiet := make(chan int)
 	select {
 	case v := <-quiet:
@@ -127,15 +203,62 @@ func main() {
 		fmt.Println("timeout")
 	}
 
-	// select with default: non-blocking receive
 	select {
 	case v := <-quiet:
 		fmt.Println(v)
 	default:
 		fmt.Println("nothing ready")
 	}
+}
+```
 
-	// context cancellation
+```text output
+timeout
+nothing ready
+```
+
+## A nil channel case never fires
+
+In a `select` with a `default`, the nil case is simply not chosen. Drop
+the `default` and that receive blocks forever, which is how you disable a
+case without removing it: assign the channel to nil.
+
+```go file=n07.go
+package main
+
+import "fmt"
+
+func main() {
+	var ch chan int
+	select {
+	case v := <-ch:
+		fmt.Println(v)
+	default:
+		fmt.Println("nothing ready")
+	}
+}
+```
+
+```text output
+nothing ready
+```
+
+## `context` cancels and times out
+
+`cancel` makes `ctx.Done()` ready and sets `context.Canceled`. A timeout
+sets `context.DeadlineExceeded`. Pass the context down; do not store it in
+a struct.
+
+```go file=n08.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -150,14 +273,72 @@ func main() {
 	defer cancel2()
 	<-ctx2.Done()
 	fmt.Println(ctx2.Err())
+}
+```
 
-	// sync.Once
+```text output
+context canceled
+context deadline exceeded
+```
+
+## `sync.Once` runs a function one time
+
+The first `Do` calls it. Later `Do`s on the same `Once` return immediately,
+even from other goroutines.
+
+```go file=n09.go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
 	var once sync.Once
 	for i := 0; i < 3; i++ {
 		once.Do(func() { fmt.Println("init once") })
 	}
+}
+```
 
-	// Pipeline
+```text output
+init once
+```
+
+## A pipeline is a chain of channels
+
+The sender closes. The next stage ranges until that close, then closes its
+own output. `square(gen(...))` is both stages.
+
+```go file=n10.go
+package main
+
+import "fmt"
+
+func gen(nums ...int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for _, n := range nums {
+			out <- n
+		}
+	}()
+	return out
+}
+
+func square(in <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for n := range in {
+			out <- n * n
+		}
+	}()
+	return out
+}
+
+func main() {
 	for v := range square(gen(1, 2, 3)) {
 		fmt.Print(v, " ")
 	}
@@ -166,36 +347,8 @@ func main() {
 ```
 
 ```text output
-[0 1 4 9 16]
-ping
-6 0 false
-[10 20 30 40 50 60]
-10000 10000
-timeout
-nothing ready
-context canceled
-context deadline exceeded
-init once
 1 4 9 
 ```
-
-## Details that bite
-
-- Run with `go run -race` / `go test -race`; the race detector finds
-  unsynchronised access that tests may never trigger.
-- Only the **sender** closes a channel. Sending on a closed channel
-  panics; receiving from one returns zero values immediately.
-- A nil channel blocks forever in `select` — handy for disabling a case.
-- Goroutine leaks: a goroutine blocked on a channel nobody will ever use
-  stays forever. Always give goroutines a way to stop (`context`, a done
-  channel, closing the input).
-- `wg.Add` must happen *before* the `go` statement, never inside the
-  goroutine.
-- `main` returning ends the program even if goroutines are running.
-- All goroutines asleep at once is `fatal error: all goroutines are
-  asleep - deadlock!`.
-- Prefer a mutex for protecting state and channels for passing ownership
-  or signalling; mixing them up leads to over-complicated designs.
 
 ## Exercises
 

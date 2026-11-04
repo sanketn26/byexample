@@ -1,10 +1,20 @@
 # Go 16 — Network programming
 
-TCP is the stream from the previous lesson with a peer attached. `net.Dial` and `net.Listen` speak `io.Reader` and `io.Writer`. A length-prefixed frame is the smallest protocol that survives a short read. `net/http` is that protocol with text headers, written for you.
+TCP is the byte stream from the previous lesson with a peer attached.
+`net.Dial` and `net.Listen` speak `io.Reader` and `io.Writer`. One `Read`
+can return a single byte of a frame, so loop until the length prefix and
+the body are both complete. Bind `127.0.0.1` and port 0: the kernel picks
+a free port, the port changes every run, and these programs print the
+payload rather than the address. This is not TLS, HTTP/2, or `epoll`.
+Those sit one layer down or up.
 
-## Example
+## A length prefix survives a short read
 
-```go file=example.go
+`sendAll` retries until every byte is written. The server reads one frame,
+upper-cases it, and writes one frame back. The client never assumes that
+one `Write` or one `Read` finished the message.
+
+```go file=n01.go
 package main
 
 import (
@@ -13,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"time"
 )
 
@@ -35,8 +44,7 @@ func readFrame(r io.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := binary.BigEndian.Uint32(hdr)
-	return readFull(r, int(n))
+	return readFull(r, int(binary.BigEndian.Uint32(hdr)))
 }
 
 func sendAll(w io.Writer, p []byte) error {
@@ -58,40 +66,26 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer ln.Close()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for _, mode := range []string{"echo", "silent", "drop"} {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			switch mode {
-			case "echo":
-				msg, err := readFrame(conn)
-				if err == nil {
-					_ = sendAll(conn, frame(bytes.ToUpper(msg)))
-				}
-			case "silent":
-				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-				buf := make([]byte, 1)
-				_, _ = conn.Read(buf)
-			default:
-				_, _ = conn.Write([]byte{0, 0})
-			}
-			conn.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		msg, err := readFrame(conn)
+		if err == nil {
+			_ = sendAll(conn, frame(bytes.ToUpper(msg)))
 		}
 	}()
 
-	dial := func() net.Conn {
-		c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
-		if err != nil {
-			panic(err)
-		}
-		return c
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		panic(err)
 	}
-
-	c := dial()
+	defer c.Close()
 	if err := sendAll(c, frame([]byte("ping"))); err != nil {
 		panic(err)
 	}
@@ -100,77 +94,199 @@ func main() {
 		panic(err)
 	}
 	fmt.Println("frame", string(msg))
-	c.Close()
+	<-done
+}
+```
 
-	c = dial()
+```text output
+frame PING
+```
+
+## A timeout is not a closed peer
+
+The server accepts and then stays silent. The client's read deadline
+fires. Closing your side matters: the timeout does not cancel the server,
+and an accept loop left inside that connection never takes the next one.
+On Rust, `set_read_timeout` usually surfaces as `WouldBlock`, not
+`TimedOut`. Treat both as a timeout.
+
+```go file=n02.go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"time"
+)
+
+func readFull(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
+
+func readFrame(r io.Reader) ([]byte, error) {
+	hdr, err := readFull(r, 4)
+	if err != nil {
+		return nil, err
+	}
+	return readFull(r, int(binary.BigEndian.Uint32(hdr)))
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1)
+		_, _ = conn.Read(buf)
+	}()
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		panic(err)
+	}
 	_ = c.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
 	_, err = readFrame(c)
+	c.Close()
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		fmt.Println("timeout")
 	} else {
 		fmt.Println("unexpected", err)
 	}
-	c.Close()
+	<-done
+}
+```
 
-	c = dial()
+```text output
+timeout
+```
+
+## A peer who closes mid-frame is `unexpected EOF`
+
+The server writes two bytes of a four-byte header and closes. That is a
+different error from a timeout. `io.EOF` before any byte, or
+`io.ErrUnexpectedEOF` after some, both mean the frame was cut off.
+
+```go file=n03.go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"time"
+)
+
+func readFull(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := io.ReadFull(r, buf)
+	return buf, err
+}
+
+func readFrame(r io.Reader) ([]byte, error) {
+	hdr, err := readFull(r, 4)
+	if err != nil {
+		return nil, err
+	}
+	return readFull(r, int(binary.BigEndian.Uint32(hdr)))
+}
+
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte{0, 0})
+	}()
+
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close()
 	_, err = readFrame(c)
 	if err == io.ErrUnexpectedEOF || err == io.EOF {
 		fmt.Println("truncated")
 	} else {
 		fmt.Println("unexpected", err)
 	}
-	c.Close()
-	ln.Close()
 	<-done
+}
+```
 
+```text output
+truncated
+```
+
+## HTTP is the same stream plus text headers
+
+`Content-Length` tells the peer when the body ends. `Connection: close` is
+the other signal. `net/http` writes those bytes for you. A hand-written
+request in C or Rust puts the same text on the socket.
+
+```go file=n04.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+)
+
+func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		fmt.Fprintf(w, "echo:%s", body)
 	})
-	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		panic(err)
 	}
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(httpLn)
-	resp, err := http.Post("http://"+httpLn.Addr().String()+"/echo", "text/plain", bytes.NewReader([]byte("hi")))
+	go srv.Serve(ln)
+	resp, err := http.Post("http://"+ln.Addr().String()+"/echo", "text/plain", bytes.NewReader([]byte("hi")))
 	if err != nil {
 		panic(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("http", resp.StatusCode, string(body))
 	srv.Close()
 }
 ```
 
 ```text output
-frame PING
-timeout
-truncated
 http 200 echo:hi
 ```
-
-## Details that bite
-
-- TCP is a stream of bytes, not a stream of messages. One `read` can
-  return a single byte of a frame. Loop until the length prefix and the
-  body are both complete.
-- Bind `127.0.0.1` and port 0. The kernel picks a free port. The port
-  changes every run, so the example prints the payload, not the address.
-- A timeout and a peer who closes mid-frame are different errors. The
-  timeout does not cancel the server: close your side, or the accept
-  loop stays stuck in the connection you abandoned.
-- On Rust, `set_read_timeout` usually surfaces as `ErrorKind::WouldBlock`,
-  not `TimedOut`. Treat both as a timeout.
-- HTTP/1.1 is the same loop plus ASCII headers. `Content-Length` tells
-  you when the body ends; `Connection: close` is the other signal. Go's
-  `net/http` and a hand-written request in C or Rust put the same bytes
-  on the socket.
-- This is not TLS, HTTP/2, or `epoll`. Those are the next layer down or
-  up. Tokio is the async version of this lesson and needs Cargo; the file
-  here stays on `std::net` and threads so `rustc` still builds it.
 
 ## Exercises
 

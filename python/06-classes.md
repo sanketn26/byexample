@@ -3,19 +3,20 @@
 Use `dataclass` for plain data, a regular class when there is behaviour and
 invariants to protect, and dunder methods to plug into the language.
 
-## Example
+## A class holds data and behaviour
 
-```python file=example.py
-from dataclasses import dataclass, field
+`interest_rate` is a class attribute, shared by every instance. `owner`
+and `_balance` are instance attributes. A leading underscore is private
+only by convention. `@property` reads like an attribute, `@classmethod`
+receives the class, and `@staticmethod` receives neither.
 
-
-# A plain class
+```python file=n01.py
 class Account:
-    interest_rate = 0.02              # class attribute, shared
+    interest_rate = 0.02
 
     def __init__(self, owner, balance=0):
-        self.owner = owner            # instance attributes
-        self._balance = balance       # leading _ : "private by convention"
+        self.owner = owner
+        self._balance = balance
 
     @property
     def balance(self):
@@ -41,31 +42,117 @@ class Account:
 
 acct = Account.empty("ada").deposit(50).deposit(25)
 print(acct, acct.balance, Account.is_valid_amount(-1))
+print(Account.interest_rate)
+try:
+    acct.deposit(0)
+except ValueError as e:
+    print(e)
+```
+
+```text output
+Account('ada', 75) 75 False
+0.02
+amount must be positive
+```
+
+## `__new__` creates the object, `__init__` fills it in
+
+`__init__` is not a constructor. `__new__` allocates the instance, then
+`__init__` initialises it. Most classes only write `__init__`.
+
+```python file=n02.py
+class Box:
+    def __new__(cls, value):
+        obj = super().__new__(cls)
+        print("new")
+        return obj
+
+    def __init__(self, value):
+        print("init")
+        self.value = value
 
 
-# Dataclasses generate __init__, __repr__, __eq__ (and ordering if asked)
+print(Box(1).value)
+```
+
+```text output
+new
+init
+1
+```
+
+## Double underscores are rewritten
+
+`self.__x` is stored as `_Account__x` (the class name is inserted). That
+avoids a clash with a subclass attribute of the same spelling. It is not
+access control.
+
+```python file=n03.py
+class Account:
+    def __init__(self):
+        self.__x = 1
+
+
+acct = Account()
+print(hasattr(acct, "__x"), acct._Account__x)
+```
+
+```text output
+False 1
+```
+
+## A dataclass writes `__init__`, `__repr__`, and `__eq__`
+
+`order=True` adds the comparison methods. `frozen=True` blocks assignment
+and, together with `eq=True`, makes the instances hashable. A mutable
+default needs `field(default_factory=...)`. Never write `= []`.
+
+```python file=n04.py
+from dataclasses import dataclass, field
+
+
 @dataclass(order=True, frozen=True)
 class Version:
     major: int
     minor: int = 0
     tags: tuple = ()
 
+
 print(Version(1, 2), Version(1, 2) == Version(1, 2), Version(1, 0) < Version(1, 5))
+print(hash(Version(1, 2)) == hash(Version(1, 2)))
+try:
+    Version(1).major = 9
+except AttributeError as e:
+    print(type(e).__name__)
 
 
 @dataclass
 class Team:
     name: str
-    members: list = field(default_factory=list)   # never `= []`
+    members: list = field(default_factory=list)
+
 
 t = Team("core")
 t.members.append("ann")
 print(t, Team("x").members)
+```
 
+```text output
+Version(major=1, minor=2, tags=()) True True
+True
+FrozenInstanceError
+Team(name='core', members=['ann']) []
+```
 
-# Dunder methods: operators and protocols
+## Dunder methods plug into operators
+
+`__add__` and `__mul__` implement `+` and `*`. `__iter__` makes unpacking
+work. `__bool__` is the truth value. `__slots__` drops the per-instance
+`__dict__`. `__eq__` plus `__hash__` lets the value live in a set.
+
+```python file=n05.py
 class Vec:
-    __slots__ = ("x", "y")            # no per-instance __dict__
+    __slots__ = ("x", "y")
 
     def __init__(self, x, y):
         self.x, self.y = x, y
@@ -92,12 +179,46 @@ class Vec:
     def __repr__(self):
         return f"Vec({self.x}, {self.y})"
 
+
 v = Vec(1, 2) + Vec(3, 4) * 2
 x, y = v
 print(v, x, y, bool(Vec(0, 0)), len({Vec(1, 1), Vec(1, 1)}))
+print(hasattr(v, "__dict__"))
+```
+
+```text output
+Vec(7, 10) 7 10 False 1
+False
+```
+
+## `__eq__` without `__hash__` is unhashable
+
+Defining `__eq__` and not `__hash__` makes instances unhashable. Python
+sets `__hash__` to `None` so a mutable equality cannot corrupt a set.
+
+```python file=n06.py
+class NoHash:
+    def __eq__(self, other):
+        return isinstance(other, NoHash)
 
 
-# Inheritance and super()
+try:
+    hash(NoHash())
+except TypeError as e:
+    print(e)
+```
+
+```text output
+unhashable type: 'NoHash'
+```
+
+## `super` follows the method resolution order
+
+`Dog.__mro__` is the order `super` searches. `isinstance` walks that same
+chain. In a multiple-inheritance tree, call `super().__init__()` so each
+parent runs once instead of you naming them by hand.
+
+```python file=n07.py
 class Animal:
     def __init__(self, name):
         self.name = name
@@ -105,42 +226,43 @@ class Animal:
     def speak(self):
         return f"{self.name} makes a sound"
 
+
 class Dog(Animal):
     def speak(self):
         return super().speak() + " (woof)"
 
+
 print(Dog("Rex").speak(), isinstance(Dog("a"), Animal), Dog.__mro__[1].__name__)
+print([cls.__name__ for cls in Dog.__mro__])
+```
 
+```text output
+Rex makes a sound (woof) True Animal
+['Dog', 'Animal', 'object']
+```
 
-# Shared class attribute vs instance attribute
+## A mutable class attribute is shared
+
+Appending to `C.items` changes every instance that has not shadowed the
+name. Assigning `a.items = ...` creates an instance attribute and hides
+the class one.
+
+```python file=n08.py
 class C:
     items = []
+
+
 a, b = C(), C()
 a.items.append(1)
 print(b.items)
-a.items = ["mine"]       # creates an instance attribute, hides the class one
+a.items = ["mine"]
 print(a.items, b.items)
 ```
 
 ```text output
-Account('ada', 75) 75 False
-Version(major=1, minor=2, tags=()) True True
-Team(name='core', members=['ann']) []
-Vec(7, 10) 7 10 False 1
-Rex makes a sound (woof) True Animal
 [1]
 ['mine'] [1]
 ```
-
-## Details that bite
-
-- Mutable class attributes are shared by every instance (see `C.items`).
-- If you define `__eq__` without `__hash__`, instances become unhashable.
-- `@dataclass` fields with mutable defaults need `default_factory`.
-- `frozen=True` makes instances immutable (and hashable with `eq=True`).
-- `__init__` is not a constructor in the C++ sense: `__new__` creates the
-  object, `__init__` initialises it.
-- Double-underscore names (`__x`) are name-mangled, not truly private.
 
 ## Exercises
 

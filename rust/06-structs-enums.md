@@ -1,15 +1,17 @@
 # Rust 06 — Structs, Enums and Pattern Matching
 
-Structs hold data, `impl` blocks add methods, and enums are *sum types*:
-each variant can carry different data. `Option` and `Result` are just
-enums.
+A struct holds fields together. An `impl` block adds functions and methods.
+An enum is a sum type: each variant can carry different data. `Option` and
+`Result` are enums from the standard library, not special syntax.
 
-## Example
+## Methods borrow, or they consume
 
-```rust file=example.rs
-use std::f64::consts::PI;
-use std::fmt;
+`Point::new` is an associated function: no `self`. `&self` reads, `&mut self`
+changes, and `self` takes ownership so the value cannot be used again.
+`#[derive]` writes `Debug`, `Clone`, `PartialEq`, and `Default` for you.
+`Copy` is only available when every field is `Copy`.
 
+```rust file=n01.rs
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Point {
     x: f64,
@@ -17,26 +19,50 @@ struct Point {
 }
 
 impl Point {
-    // Associated function (no self): the usual constructor
     fn new(x: f64, y: f64) -> Self {
         Point { x, y }
     }
 
-    // &self: read-only borrow
     fn dist(&self, other: &Point) -> f64 {
         ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
     }
 
-    // &mut self: exclusive borrow
     fn scale(&mut self, k: f64) {
         self.x *= k;
         self.y *= k;
     }
 
-    // self: consumes the value
     fn into_tuple(self) -> (f64, f64) {
         (self.x, self.y)
     }
+}
+
+fn main() {
+    let mut p = Point::new(3.0, 4.0);
+    println!("{:.1}", p.dist(&Point::default()));
+    p.scale(2.0);
+    let q = p.clone();
+    println!("{} {:?}", p == q, p.into_tuple());
+}
+```
+
+```text output
+5.0
+true (6.0, 8.0)
+```
+
+## `Display` is what `{}` prints
+
+`Debug` (`{:?}`) is the derived dump. `Display` is the text you write for
+people, and nothing derives it for you.
+
+```rust file=n02.rs
+use std::fmt;
+
+#[derive(Debug)]
+struct Point {
+    x: f64,
+    y: f64,
 }
 
 impl fmt::Display for Point {
@@ -44,6 +70,58 @@ impl fmt::Display for Point {
         write!(f, "({}, {})", self.x, self.y)
     }
 }
+
+fn main() {
+    let p = Point { x: 3.0, y: 4.0 };
+    println!("{p} {p:?}");
+}
+```
+
+```text output
+(3, 4) Point { x: 3.0, y: 4.0 }
+```
+
+## Fields are private to the module
+
+Privacy follows the module, not the type. A field without `pub` is visible
+in the same module and hidden from every other one. Methods on the type are
+how other modules are supposed to reach it.
+
+```rust file=n03.rs
+mod geo {
+    pub struct Point {
+        x: f64,
+    }
+
+    impl Point {
+        pub fn new(x: f64) -> Self {
+            Point { x }
+        }
+
+        pub fn x(&self) -> f64 {
+            self.x
+        }
+    }
+}
+
+fn main() {
+    let p = geo::Point::new(3.0);
+    println!("{}", p.x());
+}
+```
+
+```text output
+3
+```
+
+## An enum carries different data per variant
+
+`match` on an enum is exhaustive. Add a variant and every match that has no
+`_` arm stops compiling. That is the feature. There is no inheritance.
+Share behaviour with traits (lesson 09) and with composition.
+
+```rust file=n04.rs
+use std::f64::consts::PI;
 
 #[derive(Debug)]
 enum Shape {
@@ -65,32 +143,7 @@ impl Shape {
     }
 }
 
-// Newtype: a distinct type with zero runtime cost
-struct Meters(f64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Level {
-    Low = 1,
-    Mid,
-    High,
-}
-
-#[derive(Debug, Default, Clone)]
-struct Config {
-    name: String,
-    retries: u32,
-    verbose: bool,
-}
-
 fn main() {
-    let mut p = Point::new(3.0, 4.0);
-    println!("{p} {:.1}", p.dist(&Point::default()));
-    p.scale(2.0);
-    println!("{p} {:?}", p);
-    let q = p.clone();
-    println!("{}", p == q);
-    println!("{:?}", p.into_tuple());
-
     let shapes = [
         Shape::Circle { r: 1.0 },
         Shape::Rect { w: 3.0, h: 4.0 },
@@ -101,12 +154,131 @@ fn main() {
     }
     println!();
     println!("{:?}", Shape::Rect { w: 1.0, h: 2.0 });
+}
+```
 
+```text output
+3.14 12.00 6.00 
+Rect { w: 1.0, h: 2.0 }
+```
+
+## A big variant sets the size of the enum
+
+Every value of an enum is as large as the largest variant, plus a tag.
+`Box` the big payload when most values are the small ones.
+
+```rust file=n05.rs
+enum Big {
+    Small(u8),
+    Large([u8; 64]),
+}
+
+enum Boxed {
+    Small(u8),
+    Large(Box<[u8; 64]>),
+}
+
+fn main() {
+    let small = Big::Small(1);
+    let wide = Big::Large([0; 64]);
+    let slim_small = Boxed::Small(2);
+    let slim = Boxed::Large(Box::new([7; 64]));
+    let tag = match small {
+        Big::Small(n) => n as usize,
+        Big::Large(buf) => buf.len(),
+    };
+    let n = match wide {
+        Big::Large(buf) => buf.len(),
+        Big::Small(n) => n as usize,
+    };
+    let other = match slim_small {
+        Boxed::Small(n) => n,
+        Boxed::Large(buf) => buf[0],
+    };
+    let first = match slim {
+        Boxed::Large(buf) => buf[0],
+        Boxed::Small(n) => n,
+    };
+    println!(
+        "{} {} {tag} {n} {other} {first}",
+        std::mem::size_of::<Big>(),
+        std::mem::size_of::<Boxed>()
+    );
+}
+```
+
+```text output
+65 16 1 64 2 7
+```
+
+## A newtype is a different type at no runtime cost
+
+`Meters` is not an `f64`. You cannot pass one where the other is required,
+and the wrapper disappears in the generated code. Reach for it instead of a
+bare number when the unit matters.
+
+```rust file=n06.rs
+struct Meters(f64);
+
+fn main() {
     let m = Meters(5.0);
     println!("{}", m.0);
-    println!("{} {}", Level::Mid as i32, Level::Low < Level::High);
+}
+```
 
-    // Struct update syntax
+```text output
+5
+```
+
+## A fieldless enum casts one way
+
+`as` turns `Level::Mid` into an integer. The other direction is not a cast.
+Write a `match`, or implement `TryFrom`. `Copy` here is free because every
+variant is empty.
+
+```rust file=n07.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    Low = 1,
+    Mid,
+    High,
+}
+
+fn from_i32(n: i32) -> Option<Level> {
+    match n {
+        1 => Some(Level::Low),
+        2 => Some(Level::Mid),
+        3 => Some(Level::High),
+        _ => None,
+    }
+}
+
+fn main() {
+    let mid = Level::Mid;
+    let copy = mid;
+    println!("{} {} {:?}", mid as i32, Level::Low < Level::High, from_i32(copy as i32));
+}
+```
+
+```text output
+2 true Some(Mid)
+```
+
+## `..base` moves non-`Copy` fields
+
+Struct update copies the fields you do not name. A `String` is not `Copy`,
+so `..base` moves it out of `base`. Clone first when you still need the
+original. `Default` fills whatever you do not set.
+
+```rust file=n08.rs
+#[derive(Debug, Default, Clone)]
+struct Config {
+    name: String,
+    retries: u32,
+    verbose: bool,
+}
+
+fn main() {
     let base = Config {
         name: "base".into(),
         retries: 3,
@@ -120,45 +292,29 @@ fn main() {
         println!("{} x{}", custom.name, custom.retries);
     }
     println!("{base:?}");
+}
+```
 
-    // Option is just an enum
+```text output
+base x3
+Config { name: "base", retries: 3, verbose: false }
+```
+
+## Prefer `Option` to a sentinel
+
+`None` means absent. `-1` or `""` means absent only by a comment, and both
+are easy to mix up with real data.
+
+```rust file=n09.rs
+fn main() {
     let found: Option<&str> = None;
     println!("{}", found.map_or("none".to_string(), |s| s.to_uppercase()));
 }
 ```
 
 ```text output
-(3, 4) 5.0
-(6, 8) Point { x: 6.0, y: 8.0 }
-true
-(6.0, 8.0)
-3.14 12.00 6.00 
-Rect { w: 1.0, h: 2.0 }
-5
-2 true
-base x3
-Config { name: "base", retries: 3, verbose: false }
 none
 ```
-
-## Details that bite
-
-- `#[derive(...)]` generates trait impls: `Debug`, `Clone`, `Copy`,
-  `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`. `Copy`
-  requires every field to be `Copy`.
-- Fields are private to their module by default; `pub` opens them.
-  Privacy is by module, not by type.
-- Struct update (`..base`) *moves* any non-`Copy` fields out of `base`;
-  clone it first if you still need it.
-- `match` on an enum is exhaustive. Adding a variant breaks every match
-  that lacks a `_` arm — which is the feature.
-- Unit-only enums cast to integers with `as`; the reverse needs a
-  `TryFrom` implementation or a match.
-- There is no inheritance. Share behaviour with traits (lesson 09) and
-  composition.
-- Large enums are as big as their largest variant; `Box` the big one if
-  size matters.
-- Prefer `Option<T>` to sentinel values like `-1` or empty strings.
 
 ## Exercises
 

@@ -1,16 +1,19 @@
 # Rust 09 — Traits and Generics
 
-Traits describe shared behaviour. Generics with trait bounds give you
-zero-cost static dispatch; `dyn Trait` gives you runtime polymorphism when
-you need a heterogeneous collection.
+A trait is a set of methods. A generic with a trait bound is monomorphised:
+one copy of the function per concrete type, no vtable. `dyn Trait` is the
+other choice, when one collection has to hold different types. Generics
+make more code. `dyn` makes an indirect call. Derive `Debug`, `Clone`,
+`PartialEq`, `Default`, and `Hash` when the derived behaviour is the one
+you want. Hand-write the impl when it is not.
 
-## Example
+## A trait can carry a default method
 
-```rust file=example.rs
-use std::fmt::{self, Display};
-use std::ops::{Add, Mul};
+You implement the methods that have no body. `name` has a default, and
+`Square` keeps it. `describe` calls both. `impl Trait` in argument position
+is a generic: static dispatch, one concrete type per call.
 
-// A trait with a required and a default method
+```rust file=n01.rs
 trait Shape {
     fn area(&self) -> f64;
 
@@ -41,17 +44,96 @@ impl Shape for Square {
     }
 }
 
-// Static dispatch: monomorphised, no runtime cost
 fn print_it(s: &impl Shape) -> String {
     s.describe()
 }
 
-// Dynamic dispatch: a heterogeneous collection behind a vtable
+fn main() {
+    println!("{} | {}", print_it(&Circle(1.0)), print_it(&Square(2.0)));
+}
+```
+
+```text output
+circle 3.14 | shape 4.00
+```
+
+## `dyn Trait` is one type for many implementors
+
+A `Vec` cannot hold both `Circle` and `Square` without erasing the type.
+`Box<dyn Shape>` does that. The trait object must live behind a pointer
+(`&`, `Box`, or `Rc`). Not every trait can be a trait object: a method that
+is generic, or that returns `Self`, is not object-safe.
+
+```rust file=n02.rs
+trait Shape {
+    fn area(&self) -> f64;
+}
+
+struct Circle(f64);
+struct Square(f64);
+
+impl Shape for Circle {
+    fn area(&self) -> f64 {
+        std::f64::consts::PI * self.0 * self.0
+    }
+}
+
+impl Shape for Square {
+    fn area(&self) -> f64 {
+        self.0 * self.0
+    }
+}
+
 fn total_area(shapes: &[Box<dyn Shape>]) -> f64 {
     shapes.iter().map(|s| s.area()).sum()
 }
 
-// Operator overloading is just trait implementation
+fn main() {
+    let shapes: Vec<Box<dyn Shape>> = vec![Box::new(Circle(1.0)), Box::new(Square(2.0))];
+    println!("{:.2}", total_area(&shapes));
+}
+```
+
+```text output
+7.14
+```
+
+## The orphan rule decides who may implement
+
+You may implement a trait only if your crate owns the trait or the type.
+`Display` for `Vec<T>` is illegal: both belong to the standard library.
+Wrap the vector in a newtype and implement `Display` for that.
+
+```rust file=n03.rs
+use std::fmt;
+
+struct Labels(Vec<&'static str>);
+
+impl fmt::Display for Labels {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0.join(","))
+    }
+}
+
+fn main() {
+    println!("{}", Labels(vec!["a", "b"]));
+}
+```
+
+```text output
+a,b
+```
+
+## Operators are traits
+
+`+` is `Add`. `*` is `Mul`. `Mul<i32>` is a generic parameter because many
+right-hand types are reasonable. An associated type is the other tool: use
+it when each implementor has one natural choice, the way `Iterator` has one
+`Item`.
+
+```rust file=n04.rs
+use std::ops::{Add, Mul};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct V2 {
     x: i32,
@@ -72,7 +154,23 @@ impl Mul<i32> for V2 {
     }
 }
 
-// Implementing Iterator gives you map/filter/sum/... for free
+fn main() {
+    let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 } * 2;
+    println!("{v:?}");
+}
+```
+
+```text output
+V2 { x: 7, y: 10 }
+```
+
+## `Iterator` unlocks the adapters
+
+`next` is the only method you must write. `map`, `filter`, and `sum` come
+with the trait. `type Item` is the associated type: a countdown yields
+`u32`, not whatever the caller asks for.
+
+```rust file=n05.rs
 struct Countdown(u32);
 
 impl Iterator for Countdown {
@@ -87,7 +185,23 @@ impl Iterator for Countdown {
     }
 }
 
-// From/Into for conversions
+fn main() {
+    println!("{:?}", Countdown(3).collect::<Vec<_>>());
+    println!("{}", Countdown(5).filter(|n| n % 2 == 1).sum::<u32>());
+}
+```
+
+```text output
+[3, 2, 1]
+9
+```
+
+## `From` gives you `Into` as well
+
+Implement `From<A> for B`. Callers can write `B::from(a)` or `a.into()`.
+The blanket impl of `Into` is why you do not write both.
+
+```rust file=n06.rs
 struct Celsius(f64);
 struct Fahrenheit(f64);
 
@@ -97,7 +211,26 @@ impl From<Celsius> for Fahrenheit {
     }
 }
 
-// A generic type with bounds on its methods
+fn main() {
+    let f: Fahrenheit = Celsius(0.0).into();
+    println!("{} {}", f.0, Fahrenheit::from(Celsius(100.0)).0);
+}
+```
+
+```text output
+32 212
+```
+
+## Bounds can sit on the `impl`, not the type
+
+`Stack<T>` stores anything. `render` exists only when `T: Display`. A
+`where` clause is the same bound, written after the signature when the list
+gets long. Lifetimes go in that list too: `T: Display + 'static`, or
+`F: Fn(&str) -> &str`.
+
+```rust file=n07.rs
+use std::fmt::{self, Display};
+
 struct Stack<T> {
     items: Vec<T>,
 }
@@ -108,7 +241,34 @@ impl<T: Display> Stack<T> {
     }
 }
 
-// A blanket impl: every Display type gets .shout()
+fn show_all<T>(items: &[T]) -> String
+where
+    T: fmt::Debug,
+{
+    format!("{items:?}")
+}
+
+fn main() {
+    let st = Stack { items: vec![1, 2, 3] };
+    println!("{}", st.render());
+    println!("{}", show_all(&["a", "b"]));
+}
+```
+
+```text output
+1,2,3
+["a", "b"]
+```
+
+## A blanket impl covers every matching type
+
+`impl<T: Display> Shout for T` gives `.shout()` to every displayed type.
+The trait has to be in scope or the method is invisible, the same as any
+other trait you `use`.
+
+```rust file=n08.rs
+use std::fmt::Display;
+
 trait Shout {
     fn shout(&self) -> String;
 }
@@ -119,68 +279,14 @@ impl<T: Display> Shout for T {
     }
 }
 
-// A where clause keeps long bounds readable
-fn show_all<T>(items: &[T]) -> String
-where
-    T: fmt::Debug,
-{
-    format!("{items:?}")
-}
-
 fn main() {
-    println!("{} | {}", print_it(&Circle(1.0)), print_it(&Square(2.0)));
-
-    let shapes: Vec<Box<dyn Shape>> = vec![Box::new(Circle(1.0)), Box::new(Square(2.0))];
-    println!("{:.2}", total_area(&shapes));
-
-    println!("{:?}", Countdown(3).collect::<Vec<_>>());
-    println!("{}", Countdown(5).filter(|n| n % 2 == 1).sum::<u32>());
-
-    let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 } * 2;
-    println!("{v:?}");
-
-    let f: Fahrenheit = Celsius(0.0).into();
-    println!("{} {}", f.0, Fahrenheit::from(Celsius(100.0)).0);
-
-    let st = Stack { items: vec![1, 2, 3] };
-    println!("{}", st.render());
-
     println!("{} {}", 42.shout(), "hi".shout());
-    println!("{}", show_all(&["a", "b"]));
 }
 ```
 
 ```text output
-circle 3.14 | shape 4.00
-7.14
-[3, 2, 1]
-9
-V2 { x: 7, y: 10 }
-32 212
-1,2,3
 42! hi!
-["a", "b"]
 ```
-
-## Details that bite
-
-- **Orphan rule**: you can implement a trait for a type only if you own the
-  trait *or* the type. You cannot implement `Display` for `Vec<T>`; wrap
-  it in a newtype.
-- Not every trait can be a trait object: methods must not be generic or
-  return `Self` (object safety).
-- `impl Trait` in argument position is sugar for a generic; in return
-  position it hides one concrete type. `dyn Trait` is the type-erased,
-  pay-for-a-vtable option and must live behind a pointer (`&`, `Box`,
-  `Rc`).
-- Generics are monomorphised: fast code, bigger binaries.
-- Trait methods are only callable when the trait is in scope (`use`).
-- Use associated types (`type Item`) when each implementor has one natural
-  choice; use generic parameters (`Add<Rhs>`) when many are valid.
-- Derive what you can (`Debug`, `Clone`, `PartialEq`, `Default`, `Hash`);
-  hand-write only when behaviour differs.
-- Lifetimes and trait bounds combine: `T: Display + 'static`,
-  `F: Fn(&str) -> &str`.
 
 ## Exercises
 

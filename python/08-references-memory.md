@@ -1,137 +1,318 @@
 # Python 08 — References, Mutability and Memory
 
-Names point to objects. Understanding identity, mutability and reference
-counting explains most "spooky" Python bugs.
+Names point to objects. Identity, mutability, and reference counting explain
+most of the spooky bugs.
 
-## Example
+## `is` tests identity, `==` tests equality
 
-```python file=example.py
-import sys
-import gc
-import weakref
+Two equal lists are not the same object. `id` is that identity as an
+integer. Use `is` for `None`, not for values.
 
-# Identity vs equality
+```python file=n01.py
 a = [1, 2, 3]
 b = a
 c = [1, 2, 3]
 print(a is b, a is c, a == c, id(a) == id(b))
+```
 
-# Mutating through an alias
+```text output
+True False True True
+```
+
+## Mutation shows through every alias
+
+`append` changes the object both names point at. Rebinding `b` points that
+name at a new object and leaves `a` alone.
+
+```python file=n02.py
+a = [1, 2, 3]
+b = a
 b.append(4)
 print(a)
-
-# Rebinding does not affect the other name
 b = [0]
 print(a, b)
+```
 
-# Immutable objects: "modification" creates a new object
+```text output
+[1, 2, 3, 4]
+[1, 2, 3, 4] [0]
+```
+
+## An immutable update builds a new object
+
+`s += "c"` does not edit the old string. It rebinds `s`, so the id changes.
+
+```python file=n03.py
 s = "ab"
 before = id(s)
 s += "c"
 print(id(s) == before)
+```
 
-# Functions receive references
+```text output
+False
+```
+
+## `+=` mutates a list and rebinds a tuple
+
+On a list, `+=` updates the object in place, so aliases see it. On a tuple
+or a string it rebinds the name, and the old object stays as it was.
+
+```python file=n04.py
+a = [1]
+b = a
+a += [2]
+print(a, b, a is b)
+t = (1,)
+u = t
+t += (2,)
+print(u, t, t is u)
+```
+
+```text output
+[1, 2] [1, 2] True
+(1,) (1, 2) False
+```
+
+## A function receives the object, not a copy
+
+Appending inside the function changes the caller's list. Assigning to the
+parameter rebinds the local name only.
+
+```python file=n05.py
 def mutate(xs):
-    xs.append("m")          # visible to caller
+    xs.append("m")
+
 
 def rebind(xs):
-    xs = ["new"]            # local only
+    xs = ["new"]
     return xs
+
 
 data = []
 mutate(data)
 rebind(data)
 print(data)
+```
 
-# Reference counting
+```text output
+['m']
+```
+
+## Reference counting frees an object at zero
+
+`sys.getrefcount` includes the temporary reference from the call, so
+subtract one. Binding another name increases the count. `del` drops a name.
+
+```python file=n06.py
+import sys
+
 x = object()
-print(sys.getrefcount(x) - 1)   # minus the temporary argument reference
+print(sys.getrefcount(x) - 1)
 y = x
 print(sys.getrefcount(x) - 1)
 del y
 print(sys.getrefcount(x) - 1)
+```
 
-# Cycles need the garbage collector
+```text output
+1
+2
+1
+```
+
+## A cycle waits for the garbage collector
+
+Two objects pointing at each other never hit a zero count, so the cycle
+collector has to find them. A `weakref` watches that without keeping the
+object alive.
+
+```python file=n07.py
+import gc
+import weakref
+
+
 class Node:
     def __init__(self):
         self.other = None
+
 
 n1, n2 = Node(), Node()
 n1.other, n2.other = n2, n1
 probe = weakref.ref(n1)
 del n1, n2
-print(probe() is not None)      # still alive: refcount never hit zero
+print(probe() is not None)
 gc.collect()
-print(probe() is None)          # cycle collector reclaimed it
+print(probe() is None)
+```
 
-# Weak references do not keep objects alive
+```text output
+True
+True
+```
+
+## A weak reference does not keep the object alive
+
+After the last strong name is gone, calling the weakref returns `None`.
+
+```python file=n08.py
+import weakref
+
+
 class Big:
     pass
+
 
 obj = Big()
 w = weakref.ref(obj)
 print(w() is obj)
 del obj
 print(w())
+```
 
-# Small-int / interned-string caching is an optimisation, not a contract
+```text output
+True
+None
+```
+
+## Interning is an optimisation, not a contract
+
+CPython may make `is` true for small integers and for some strings. Only
+use `is` with `None`, `True`, `False`, and sentinels you created.
+
+```python file=n09.py
 p, q = 256, 256
-print(p is q)                   # True in CPython, but never rely on this
+print(p == q, p is q)
+a = int("1000")
+b = int("1000")
+print(a == b, a is b)
+left = "hello"
+right = "".join(["he", "llo"])
+print(left == right, left is right)
+```
 
-# Hidden sharing between containers
+```text output
+True True
+True False
+True False
+```
+
+## Two slots can share one inner list
+
+`grid = [row, row]` is two names for one row. Writing through either
+index changes both.
+
+```python file=n10.py
 row = [0, 0]
 grid = [row, row]
 grid[0][0] = 9
 print(grid)
+```
 
-# Hashability follows mutability
+```text output
+[[9, 0], [9, 0]]
+```
+
+## Hashability follows from immutability
+
+A list cannot be a dict key. The error says the type is unhashable.
+
+```python file=n11.py
 try:
     {[1, 2]: "no"}
 except TypeError as e:
     print(e)
+```
 
-# Sizes (CPython 3.12 on 64-bit; the exact numbers vary by version/platform)
+```text output
+cannot use 'list' as a dict key (unhashable type: 'list')
+```
+
+## `getsizeof` does not include the contents
+
+The number is the container itself. A longer list is bigger than an empty
+one, but neither figure counts the objects stored inside. The exact empty
+size depends on the version and the platform.
+
+```python file=n12.py
+import sys
+
 print(sys.getsizeof([]), sys.getsizeof([1, 2, 3]) > sys.getsizeof([]))
+```
 
-# __slots__ trades flexibility for memory
+```text output
+56 True
+```
+
+## `__slots__` omits `__dict__`
+
+Instances then have only the names you listed. A normal instance carries
+a `__dict__` that accepts any attribute.
+
+```python file=n13.py
 class P2:
     pass
+
+
 class P3:
     __slots__ = ("x",)
+
+
 print(hasattr(P2(), "__dict__"), hasattr(P3(), "__dict__"))
 ```
 
 ```text output
-True False True True
-[1, 2, 3, 4]
-[1, 2, 3, 4] [0]
-False
-['m']
-1
-2
-1
-True
-True
-True
-None
-True
-[[9, 0], [9, 0]]
-unhashable type: 'list'
-56 True
 True False
 ```
 
-## Details that bite
+## `del` drops a name, not every alias
 
-- `sys.getsizeof` is shallow: a list's size excludes the objects inside.
-- `is` on ints and strings may be `True` because of caching. Only use `is`
-  with `None`, `True`/`False`, and sentinels you created.
-- `a += b` on a list *mutates in place* (aliases see it); on a tuple or str
-  it rebinds.
-- `copy.copy` / `list(x)` / `x[:]` are shallow; nested objects stay shared.
-- `__del__` is not a reliable destructor; use context managers.
-- Large temporary structures stay alive as long as any name references them
-  — `del name` or narrowing scope releases them.
+The object stays alive while any name still points at it. `del` on the
+last name, or leaving the scope, releases it.
+
+```python file=n14.py
+temp = [1, 2, 3]
+alias = temp
+del temp
+print(alias)
+try:
+    print(temp)
+except NameError as e:
+    print(type(e).__name__)
+```
+
+```text output
+[1, 2, 3]
+NameError
+```
+
+## `__del__` is not a destructor
+
+It may run late, or never, when a cycle keeps the object. A context
+manager releases the resource at a known line.
+
+```python file=n15.py
+class Box:
+    def __init__(self):
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.closed = True
+        return False
+
+
+with Box() as box:
+    print("open", box.closed)
+print("closed", box.closed)
+```
+
+```text output
+open False
+closed True
+```
 
 ## Exercises
 

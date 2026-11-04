@@ -1,22 +1,25 @@
 # Go 09 — Interfaces
 
-Interfaces are satisfied **implicitly**: a type implements an interface by
-having the methods, with no declaration. Small interfaces defined by the
-*consumer* are the heart of Go design.
+Interfaces are satisfied implicitly: a type implements an interface by
+having the methods, with no declaration. Define small interfaces where they
+are used (`io.Reader`, `fmt.Stringer`), accept interfaces, and return
+concrete types. Do not add an interface until a second implementation or a
+test double appears. `any` drops every static check; prefer generics when
+the logic is the same for several types.
 
-## Example
+## Types satisfy interfaces with no declaration
 
-```go file=example.go
+`Rect` and `Circle` are `Shape` because they have `Area`. `var _ Shape = Rect{}`
+fails the build if that stops being true. The method set of `T` has only
+value receivers; `*T` has both. Storing a `T` where the methods use pointer
+receivers does not compile.
+
+```go file=n01.go
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"math"
-	"os"
-	"sort"
-	"time"
 )
 
 type Shape interface {
@@ -29,24 +32,119 @@ type Circle struct{ R float64 }
 func (r Rect) Area() float64   { return r.W * r.H }
 func (c Circle) Area() float64 { return math.Pi * c.R * c.R }
 
-// Compile-time proof that Rect satisfies Shape.
 var _ Shape = Rect{}
 
-// A Writer that upper-cases everything passing through: wraps another Writer.
+func main() {
+	shapes := []Shape{Rect{3, 4}, Circle{1}}
+	for _, s := range shapes {
+		fmt.Printf("%T %.2f\n", s, s.Area())
+	}
+}
+```
+
+```text output
+main.Rect 12.00
+main.Circle 3.14
+```
+
+## Wrap an interface to change the bytes
+
+`upperWriter` is an `io.Writer` because it has `Write`. It forwards to
+another writer after upper-casing. Callers pass it anywhere a `Writer` is
+wanted.
+
+```go file=n02.go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+)
+
 type upperWriter struct{ w io.Writer }
 
 func (u upperWriter) Write(p []byte) (int, error) {
 	return u.w.Write(bytes.ToUpper(p))
 }
 
-// sort.Interface: three methods give you sorting for any collection.
+func main() {
+	fmt.Fprintf(upperWriter{os.Stdout}, "hello %d\n", 5)
+}
+```
+
+```text output
+HELLO 5
+```
+
+## A comma-ok assertion never panics
+
+`v.(T)` panics when `v` does not hold a `T`. The two-result form returns
+the zero value and false instead. Use it when the type is only a
+possibility.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
+func main() {
+	var v any = "hi"
+	s, ok := v.(string)
+	n, ok2 := v.(int)
+	fmt.Println(s, ok, n, ok2)
+}
+```
+
+```text output
+hi true 0 false
+```
+
+## Three methods are enough to sort
+
+`sort.Interface` is `Len`, `Less`, and `Swap`. A named slice type adds
+those methods, and `sort.Sort` does the rest. `byLen` sorts by length, not
+by text.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"sort"
+)
+
 type byLen []string
 
 func (b byLen) Len() int           { return len(b) }
 func (b byLen) Less(i, j int) bool { return len(b[i]) < len(b[j]) }
 func (b byLen) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 
-// Depend on a tiny interface so tests (and callers) can substitute it.
+func main() {
+	words := []string{"ccc", "a", "bb"}
+	sort.Sort(byLen(words))
+	fmt.Println(words)
+}
+```
+
+```text output
+[a bb ccc]
+```
+
+## A tiny interface is easy to replace
+
+`greeting` asks only for `Now`. A test passes a clock stuck at 09:00
+instead of the real time. A twelve-line fake beats a mock framework.
+
+```go file=n05.go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
 type Clock interface{ Now() time.Time }
 
 type fixedClock struct{ t time.Time }
@@ -61,51 +159,70 @@ func greeting(c Clock) string {
 }
 
 func main() {
-	shapes := []Shape{Rect{3, 4}, Circle{1}}
-	for _, s := range shapes {
-		fmt.Printf("%T %.2f\n", s, s.Area())
-	}
-
-	fmt.Fprintf(upperWriter{os.Stdout}, "hello %d\n", 5)
-
-	var v any = "hi"
-	s, ok := v.(string)
-	n, ok2 := v.(int) // comma-ok form never panics
-	fmt.Println(s, ok, n, ok2)
-
-	words := []string{"ccc", "a", "bb"}
-	sort.Sort(byLen(words))
-	fmt.Println(words)
-
 	morning := fixedClock{time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)}
 	fmt.Println(greeting(morning))
 }
 ```
 
 ```text output
-main.Rect 12.00
-main.Circle 3.14
-HELLO 5
-hi true 0 false
-[a bb ccc]
 good morning
 ```
 
-## Details that bite
+## An interface holding a nil pointer is not nil
 
-- Interfaces hold a *(dynamic type, value)* pair. An interface holding a
-  nil pointer is **not** `== nil` (see lesson 07).
-- A method set depends on the receiver: `T` has only value-receiver
-  methods, `*T` has both. Storing a `T` in an interface when the methods
-  have pointer receivers is a compile error.
-- Define interfaces where they are *used*, keep them to one or two methods
-  (`io.Reader`, `fmt.Stringer`), and "accept interfaces, return structs".
-- The empty interface `any` loses all type safety; prefer generics when
-  the logic is the same across types.
-- Comparing interfaces panics at runtime if the dynamic types are
-  uncomparable (slices, maps, funcs).
-- Don't create an interface "in case we need it later". Add one when a
-  second implementation or a test double appears.
+The interface value is `(type, pointer)`. The pointer may be nil while the
+type is set, and then `s == nil` is false. Return a bare `nil` when there
+is no value. See also the typed-nil trap in the errors lesson.
+
+```go file=n06.go
+package main
+
+import "fmt"
+
+type Shape interface{ Area() float64 }
+
+type Rect struct{ W, H float64 }
+
+func (r *Rect) Area() float64 {
+	if r == nil {
+		return 0
+	}
+	return r.W * r.H
+}
+
+func main() {
+	var p *Rect
+	var s Shape = p
+	fmt.Println(p == nil, s == nil)
+}
+```
+
+```text output
+true false
+```
+
+## Comparing uncomparable dynamic types panics
+
+`==` on two interfaces looks at the values inside. Slices, maps, and
+functions are not comparable, so the comparison panics at run time even
+though the program compiled.
+
+```go file=n07.go
+package main
+
+import "fmt"
+
+func main() {
+	defer func() { fmt.Println("recovered:", recover()) }()
+	var a any = []int{1}
+	var b any = []int{1}
+	fmt.Println(a == b)
+}
+```
+
+```text output
+recovered: runtime error: comparing uncomparable type []int
+```
 
 ## Exercises
 

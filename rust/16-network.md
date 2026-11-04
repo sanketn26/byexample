@@ -1,14 +1,24 @@
 # Rust 16 — Network programming
 
-TCP is the stream from the previous lesson with a peer attached. `TcpStream` implements `Read` and `Write`. A length-prefixed frame is the smallest protocol that survives a short read. HTTP/1.1 below is the same bytes, written by hand, because the standard library has no HTTP client. Async Rust (Tokio) is this design on a runtime; it needs Cargo, so this file stays on threads.
+TCP is the stream from the previous lesson with a peer attached.
+`TcpStream` implements `Read` and `Write`. One `read` can return a single
+byte of a frame, so a length prefix is the smallest protocol that survives
+that. Bind `127.0.0.1` and port 0. The kernel picks a free port, and the
+port changes every run, so these programs print the payload, not the
+address. This is not TLS, HTTP/2, or `epoll`. Tokio is the async version of
+the same design, and it needs Cargo. The file stays on `std::net` and
+threads so `rustc` still builds it.
 
-## Example
+## A frame survives a short read
 
-```rust file=example.rs
+`read_exact` loops until the header and the body are both complete.
+`write` is retried from the first byte that was not accepted. The server
+uppercases the body and sends it back as another frame.
+
+```rust file=n01.rs
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::Duration;
 
 fn read_full(mut src: impl Read, n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
@@ -43,33 +53,63 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let server = thread::spawn(move || -> io::Result<()> {
-        for mode in ["echo", "silent", "drop"] {
-            let (mut conn, _) = listener.accept()?;
-            match mode {
-                "echo" => {
-                    let msg = read_frame(&mut conn)?;
-                    let up: Vec<u8> = msg.iter().map(|b| b.to_ascii_uppercase()).collect();
-                    write_all_retry(&mut conn, &frame(&up))?;
-                }
-                "silent" => {
-                    conn.set_read_timeout(Some(Duration::from_secs(2)))?;
-                    let mut b = [0u8; 1];
-                    let _ = conn.read(&mut b);
-                }
-                _ => {
-                    let _ = conn.write(&[0, 0]);
-                }
-            }
-        }
+        let (mut conn, _) = listener.accept()?;
+        let msg = read_frame(&mut conn)?;
+        let up: Vec<u8> = msg.iter().map(|b| b.to_ascii_uppercase()).collect();
+        write_all_retry(&mut conn, &frame(&up))?;
         Ok(())
     });
-
     let mut c = TcpStream::connect(addr)?;
     write_all_retry(&mut c, &frame(b"ping"))?;
     let msg = read_frame(&mut c)?;
     println!("frame {}", String::from_utf8_lossy(&msg));
     drop(c);
+    server.join().unwrap()?;
+    Ok(())
+}
+```
 
+```text output
+frame PING
+```
+
+## A timeout is not a closed peer
+
+The server accepts and then waits. The client gives the read 150
+milliseconds. On Rust, `set_read_timeout` usually surfaces as
+`ErrorKind::WouldBlock`, not `TimedOut`. Treat both as a timeout. Drop your
+side afterwards. The timeout does not cancel the server: an accept loop
+that stays in the connection you abandoned is stuck. Closing the socket is
+what lets it proceed.
+
+```rust file=n02.rs
+use std::io::{self, Read};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+fn read_full(mut src: impl Read, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    src.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_frame(src: &mut impl Read) -> io::Result<Vec<u8>> {
+    let header = read_full(&mut *src, 4)?;
+    let n = u32::from_be_bytes(header.as_slice().try_into().unwrap()) as usize;
+    read_full(src, n)
+}
+
+fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut conn, _) = listener.accept()?;
+        conn.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut b = [0u8; 1];
+        let _ = conn.read(&mut b);
+        Ok(())
+    });
     let mut c = TcpStream::connect(addr)?;
     c.set_read_timeout(Some(Duration::from_millis(150)))?;
     match read_frame(&mut c) {
@@ -79,7 +119,46 @@ fn main() -> io::Result<()> {
         other => println!("unexpected {other:?}"),
     }
     drop(c);
+    server.join().unwrap()?;
+    Ok(())
+}
+```
 
+```text output
+timeout
+```
+
+## A peer that closes mid-frame is `UnexpectedEof`
+
+Two bytes are not a four-byte header. That is a different error from the
+timeout. The server writes them and returns. The client's `read_exact`
+stops because the stream ended.
+
+```rust file=n03.rs
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+fn read_full(mut src: impl Read, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    src.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_frame(src: &mut impl Read) -> io::Result<Vec<u8>> {
+    let header = read_full(&mut *src, 4)?;
+    let n = u32::from_be_bytes(header.as_slice().try_into().unwrap()) as usize;
+    read_full(src, n)
+}
+
+fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let server = thread::spawn(move || -> io::Result<()> {
+        let (mut conn, _) = listener.accept()?;
+        let _ = conn.write(&[0, 0]);
+        Ok(())
+    });
     let mut c = TcpStream::connect(addr)?;
     match read_frame(&mut c) {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => println!("truncated"),
@@ -87,7 +166,38 @@ fn main() -> io::Result<()> {
     }
     drop(c);
     server.join().unwrap()?;
+    Ok(())
+}
+```
 
+```text output
+truncated
+```
+
+## HTTP/1.1 is the same bytes plus headers
+
+The standard library has no HTTP client. The request below is written by
+hand. `Content-Length` says when the body ends. `Connection: close` is the
+other signal. A blank line (`\r\n\r\n`) ends the headers. Go's `net/http`
+and a hand-written request in C put the same bytes on the socket.
+
+```rust file=n04.rs
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+fn write_all_retry(dst: &mut impl Write, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = dst.write(buf)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short write"));
+        }
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
     let http_listener = TcpListener::bind("127.0.0.1:0")?;
     let http_addr = http_listener.local_addr()?;
     let http = thread::spawn(move || -> io::Result<()> {
@@ -121,31 +231,8 @@ fn main() -> io::Result<()> {
 ```
 
 ```text output
-frame PING
-timeout
-truncated
 http echo:hi
 ```
-
-## Details that bite
-
-- TCP is a stream of bytes, not a stream of messages. One `read` can
-  return a single byte of a frame. Loop until the length prefix and the
-  body are both complete.
-- Bind `127.0.0.1` and port 0. The kernel picks a free port. The port
-  changes every run, so the example prints the payload, not the address.
-- A timeout and a peer who closes mid-frame are different errors. The
-  timeout does not cancel the server: close your side, or the accept
-  loop stays stuck in the connection you abandoned.
-- On Rust, `set_read_timeout` usually surfaces as `ErrorKind::WouldBlock`,
-  not `TimedOut`. Treat both as a timeout.
-- HTTP/1.1 is the same loop plus ASCII headers. `Content-Length` tells
-  you when the body ends; `Connection: close` is the other signal. Go's
-  `net/http` and a hand-written request in C or Rust put the same bytes
-  on the socket.
-- This is not TLS, HTTP/2, or `epoll`. Those are the next layer down or
-  up. Tokio is the async version of this lesson and needs Cargo; the file
-  here stays on `std::net` and threads so `rustc` still builds it.
 
 ## Exercises
 

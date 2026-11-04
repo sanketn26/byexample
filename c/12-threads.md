@@ -1,21 +1,33 @@
 # C 12 — Threads (POSIX and C11 atomics)
 
-C11 defines atomics and thread-local storage; threads themselves come from
-POSIX (`pthreads`) on Linux and macOS. There is no safety net: a data race
-is undefined behaviour. Build with `-pthread`, and use
-`-fsanitize=thread` (instead of address) when hunting races.
+C11 defines atomics and thread-local storage. The threads themselves, on
+Linux and macOS, come from POSIX threads. There is no safety net: a data
+race is undefined behaviour. Link with `-pthread`. When you are hunting
+races, use `-fsanitize=thread` instead of the address sanitizer; the two
+do not combine.
 
-## Example
+An unsynchronised read and write of the same object from two threads is a
+data race. `counter++` without a mutex loses updates. Always `pthread_join`
+or detach every thread. Do not let a thread use a stack variable of a
+function that has already returned. Pass each thread its own argument:
+handing out `&i` from a `for` loop is a classic bug, because the loop
+moves on. Take locks in one global order or you can deadlock.
 
-```c file=example.c
+`pthread_create` returns an error code. It does not set `errno`.
+`<threads.h>` exists in C11, but pthreads is the widely supported API.
+`strtok`, `localtime`, `rand`, and `strerror` may not be thread-safe; look
+for the `_r` variants.
+
+## Join before you read the result
+
+Each job is a separate struct, so the thread writes a slot the loop will
+not reuse. `pthread_join` waits until that write has happened.
+
+```c file=n01.c
 #define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
-#include <stdatomic.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 
-/* 1. Pass data in and out through a struct */
 struct job {
     int id;
     long result;
@@ -27,7 +39,42 @@ static void *square_job(void *arg) {
     return NULL;
 }
 
-/* 2. Shared counters: a mutex, and a C11 atomic */
+int main(void) {
+    pthread_t threads[4];
+    struct job jobs[4];
+    for (int i = 0; i < 4; i++) {
+        jobs[i].id = i;
+        int rc = pthread_create(&threads[i], NULL, square_job, &jobs[i]);
+        if (rc != 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+        printf("%ld ", jobs[i].result);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text output
+0 1 4 9 
+```
+
+## A mutex and an atomic both count
+
+The mutex covers the plain `long`. `atomic_fetch_add` covers `hits`.
+Atomics are for one variable or a flag. The default order is
+`memory_order_seq_cst`, and that is the safe choice. If two variables
+must change together, use a lock. Four threads each add 10000.
+
+```c file=n02.c
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+
 static long counter;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_long hits;
@@ -43,7 +90,38 @@ static void *incr(void *arg) {
     return NULL;
 }
 
-/* 3. A bounded blocking queue: mutex + two condition variables */
+int main(void) {
+    pthread_t threads[4];
+    for (int i = 0; i < 4; i++) {
+        if (pthread_create(&threads[i], NULL, incr, NULL) != 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    printf("%ld %ld\n", counter, (long)atomic_load(&hits));
+    return 0;
+}
+```
+
+```text output
+40000 40000
+```
+
+## Wait in a loop; wakeups can be spurious
+
+`pthread_cond_wait` can return when the condition is still false, and
+another thread may have taken the item. Re-check in a `while`. The
+sentinel `-1` says the producer is finished. A small integer can ride
+home in the `void *` return via `intptr_t`; it is not a pointer.
+
+```c file=n03.c
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
 struct queue {
     int items[4];
     int head, count;
@@ -53,7 +131,7 @@ struct queue {
 
 static void q_push(struct queue *q, int v) {
     pthread_mutex_lock(&q->m);
-    while (q->count == 4) { /* always re-check in a loop: spurious wakeups */
+    while (q->count == 4) {
         pthread_cond_wait(&q->not_full, &q->m);
     }
     q->items[(q->head + q->count) % 4] = v;
@@ -80,7 +158,7 @@ static void *producer(void *arg) {
     for (int i = 1; i <= 10; i++) {
         q_push(q, i);
     }
-    q_push(q, -1); /* sentinel */
+    q_push(q, -1);
     return NULL;
 }
 
@@ -91,10 +169,41 @@ static void *consumer(void *arg) {
     while ((v = q_pop(q)) != -1) {
         sum += v;
     }
-    return (void *)(intptr_t)sum; /* small integers can ride in the pointer */
+    return (void *)(intptr_t)sum;
 }
 
-/* 4. Thread-local storage: each thread gets its own copy */
+int main(void) {
+    struct queue q = {.m = PTHREAD_MUTEX_INITIALIZER,
+                      .not_empty = PTHREAD_COND_INITIALIZER,
+                      .not_full = PTHREAD_COND_INITIALIZER};
+    pthread_t prod, cons;
+    if (pthread_create(&prod, NULL, producer, &q) != 0 ||
+        pthread_create(&cons, NULL, consumer, &q) != 0) {
+        return 1;
+    }
+    void *ret = NULL;
+    pthread_join(prod, NULL);
+    pthread_join(cons, &ret);
+    printf("sum=%ld\n", (long)(intptr_t)ret);
+    return 0;
+}
+```
+
+```text output
+sum=55
+```
+
+## Each thread has its own _Thread_local
+
+The worker stores 99 in its copy and returns that copy. The main thread's
+`tl_value` is still 7. Nothing was locked, because nothing was shared.
+
+```c file=n04.c
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
 static _Thread_local int tl_value;
 
 static void *tl_job(void *arg) {
@@ -103,44 +212,12 @@ static void *tl_job(void *arg) {
 }
 
 int main(void) {
-    pthread_t threads[4];
-    struct job jobs[4];
-    for (int i = 0; i < 4; i++) {
-        jobs[i].id = i;
-        int rc = pthread_create(&threads[i], NULL, square_job, &jobs[i]);
-        if (rc != 0) { /* returns an error code, it does not set errno */
-            fprintf(stderr, "pthread_create failed: %d\n", rc);
-            return 1;
-        }
-    }
-    for (int i = 0; i < 4; i++) {
-        pthread_join(threads[i], NULL); /* join before reading results */
-        printf("%ld ", jobs[i].result);
-    }
-    printf("\n");
-
-    for (int i = 0; i < 4; i++) {
-        pthread_create(&threads[i], NULL, incr, NULL);
-    }
-    for (int i = 0; i < 4; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    printf("%ld %ld\n", counter, (long)atomic_load(&hits));
-
-    struct queue q = {.m = PTHREAD_MUTEX_INITIALIZER,
-                      .not_empty = PTHREAD_COND_INITIALIZER,
-                      .not_full = PTHREAD_COND_INITIALIZER};
-    pthread_t prod, cons;
-    pthread_create(&prod, NULL, producer, &q);
-    pthread_create(&cons, NULL, consumer, &q);
-    void *ret;
-    pthread_join(prod, NULL);
-    pthread_join(cons, &ret);
-    printf("sum=%ld\n", (long)(intptr_t)ret);
-
     tl_value = 7;
     pthread_t t;
-    pthread_create(&t, NULL, tl_job, (void *)(intptr_t)99);
+    if (pthread_create(&t, NULL, tl_job, (void *)(intptr_t)99) != 0) {
+        return 1;
+    }
+    void *ret = NULL;
     pthread_join(t, &ret);
     printf("%ld %d\n", (long)(intptr_t)ret, tl_value);
     return 0;
@@ -148,33 +225,9 @@ int main(void) {
 ```
 
 ```text output
-0 1 4 9 
-40000 40000
-sum=55
 99 7
 ```
 
-## Details that bite
-
-- An unsynchronised read/write of shared data from two threads is a
-  **data race** and undefined behaviour. `counter++` without the mutex
-  would lose updates.
-- Always `pthread_join` (or detach) every thread, and do not let a thread
-  use a stack variable of a function that has returned.
-- Pass each thread its *own* argument. Handing `&i` of a loop variable to
-  several threads is a classic bug: the loop moves on.
-- Wrap `pthread_cond_wait` in a `while` loop that re-checks the
-  condition; wakeups can be spurious and another thread may have taken
-  the item.
-- Lock ordering: always take multiple locks in the same global order, or
-  you can deadlock.
-- Atomics (`<stdatomic.h>`) are for single variables and flags;
-  `memory_order_seq_cst` is the default and the safe choice. Anything
-  needing two variables to change together needs a lock.
-- Library calls may not be thread-safe (`strtok`, `localtime`, `rand`,
-  `strerror`); look for `_r` variants.
-- On Linux you can also use C11 `<threads.h>` where available, but
-  `pthreads` is far more widely supported.
 
 ## Exercises
 

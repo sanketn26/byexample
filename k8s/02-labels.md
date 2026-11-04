@@ -1,13 +1,14 @@
 # Kubernetes 02 — Labels and Selectors
 
-Kubernetes has no foreign keys. Objects find each other through **labels**:
-free-form `key=value` pairs on metadata, matched by **selectors**. A
-Service finds its Pods this way, a Deployment finds the Pods it owns this
-way, and so do you when you run `kubectl get -l`.
+Kubernetes has no foreign keys. Objects find each other through **labels**: free-form `key=value` pairs on metadata, matched by **selectors**. A Service finds its Pods this way, a Deployment finds the Pods it owns this way, and so do you with `kubectl get -l`.
 
-## Example
+A key or value is at most 63 characters: alphanumerics plus `-_.`, starting and ending alphanumeric. No spaces. Put free text in **annotations**. Selectors do not match across namespaces unless you pass `-A`.
 
-```bash file=example.sh
+## An equality selector matches one value
+
+`kubectl run --labels` sets labels on the new Pod. `-l app=web` keeps objects whose `app` label is exactly `web`. A selector that is slightly wrong does not error. It matches nothing, and the symptom is "no endpoints" or "0 pods". Compare it with `kubectl get pods --show-labels`.
+
+```bash file=n01.sh
 #!/usr/bin/env bash
 set -euo pipefail
 ns=byex-$$
@@ -15,88 +16,188 @@ kubectl create namespace "$ns" >/dev/null
 trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
 k() { kubectl -n "$ns" "$@"; }
 
-# Three Pods with different labels. `run` is the imperative shortcut.
 k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600
 k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600
 k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600
-
-echo "--- equality selector"
 k get pods -l app=web -o name
-
-echo "--- set-based selector"
-k get pods -l 'tier in (frontend,backend)' -o name
-
-echo "--- AND: comma means both must match"
-k get pods -l app=web,tier=backend -o name | wc -l
-
-echo "--- negation and existence"
-k get pods -l 'app!=web' -o name
-k get pods -l '!canary' -o name | wc -l
-
-echo "--- show labels as columns"
-k get pods -L app,tier -o custom-columns=NAME:.metadata.name,APP:.metadata.labels.app,TIER:.metadata.labels.tier
-
-echo "--- relabel, then select again"
-k label pod web2 canary=true tier=edge --overwrite
-k get pods -l canary=true -o name
-k get pod web2 -o jsonpath='{.metadata.labels}{"\n"}'
-
-echo "--- delete by selector"
-k delete pods -l app=web --wait=false
-k wait --for=delete pod -l app=web --timeout=90s
-k get pods -o name
 ```
 
 ```text output
 pod/web1 created
 pod/web2 created
 pod/db1 created
---- equality selector
 pod/web1
 pod/web2
---- set-based selector
+```
+
+## `in` is a set on one key
+
+`in (a,b)` is the only OR, and it covers one key. A comma between selectors is AND, not OR.
+
+```bash file=n02.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k get pods -l 'tier in (frontend,backend)' -o name
+```
+
+```text output
 pod/db1
 pod/web1
 pod/web2
---- AND: comma means both must match
+```
+
+## A comma means both must match
+
+Each extra term narrows the set. `app=web` and `tier=backend` do not overlap, so the count is zero.
+
+```bash file=n03.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k get pods -l app=web,tier=backend -o name 2>/dev/null | wc -l
+```
+
+```text output
 0
---- negation and existence
+```
+
+## `!=` drops one value
+
+`app!=web` keeps Pods whose `app` is not `web`, and Pods that have no `app` label. `!key` is the separate test for "this key is absent".
+
+```bash file=n04.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k get pods -l 'app!=web' -o name
+```
+
+```text output
 pod/db1
+```
+
+## `!key` selects a missing label
+
+`!canary` matches Pods that do not have that key at all. None of these three do.
+
+```bash file=n05.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k get pods -l '!canary' -o name | wc -l
+```
+
+```text output
 3
---- show labels as columns
+```
+
+## `-L` adds label columns
+
+`-L app,tier` asks for those labels. `custom-columns` names the same fields explicitly, which is the stable form. The usual keys are `app.kubernetes.io/name`, `app.kubernetes.io/instance`, and `app.kubernetes.io/version`. Helm relies on them.
+
+```bash file=n06.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k get pods -L app,tier -o custom-columns=NAME:.metadata.name,APP:.metadata.labels.app,TIER:.metadata.labels.tier
+```
+
+```text output
 NAME   APP   TIER
 db1    db    backend
 web1   web   frontend
 web2   web   frontend
---- relabel, then select again
+```
+
+## `kubectl label` changes labels on a live Pod
+
+`--overwrite` replaces a key that already exists. Relabeling can detach a Pod from a Deployment or Service: it stops receiving traffic and stays up to inspect.
+
+```bash file=n07.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k label pod web2 canary=true tier=edge --overwrite
+k get pods -l canary=true -o name
+k get pod web2 -o jsonpath='{.metadata.labels}{"\n"}'
+```
+
+```text output
 pod/web2 labeled
 pod/web2
 {"app":"web","canary":"true","tier":"edge"}
---- delete by selector
+```
+
+## `kubectl delete -l` deletes by selector
+
+The selector chooses the Pods. `wait --for=delete` returns when they are gone. `db1` does not match `app=web`, so it stays.
+
+```bash file=n08.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k run web1 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run web2 --image=busybox:1.36 --labels=app=web,tier=frontend -- sleep 3600 >/dev/null
+k run db1  --image=busybox:1.36 --labels=app=db,tier=backend   -- sleep 3600 >/dev/null
+k delete pods -l app=web --wait=false
+k wait --for=delete pod -l app=web --timeout=90s
+k get pods -o name
+```
+
+```text output
 pod "web1" deleted
 pod "web2" deleted
 pod/web1 condition met
 pod/web2 condition met
 pod/db1
 ```
-
-## Details that bite
-
-- Label keys and values are limited: 63 characters, alphanumerics plus
-  `-_.`, start and end alphanumeric. No spaces. Use **annotations** for
-  free text.
-- Selectors do **not** match across namespaces. Every `-l` query is scoped
-  to one namespace unless you pass `-A`.
-- Comma is AND. There is no OR except `in (a,b)` over **one** key.
-- A Service's `selector` or a Deployment's `matchLabels` that is slightly
-  wrong does not error. It just matches nothing, and the symptom is
-  "no endpoints" or "0 pods". When something that should find Pods finds
-  none, compare the selector against `k get pods --show-labels`.
-- Changing a Pod's labels can *detach* it from a Deployment or Service.
-  That is a useful trick: relabel a misbehaving Pod and it stops receiving
-  traffic but stays alive to inspect.
-- Common convention: `app.kubernetes.io/name`, `.../instance`,
-  `.../version`. Tools such as Helm rely on them.
 
 ## Exercises
 

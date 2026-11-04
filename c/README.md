@@ -1,7 +1,7 @@
 # C by Example (practice edition)
 
-C11. Lessons are built with
-`gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g file.c -lm`
+C11. Each lesson is a series of tiny programs, one concept each, built with
+`gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g n01.c -lm`
 so that undefined behaviour and leaks fail loudly. Exercise stubs compile
 but report `FAIL` until solved.
 

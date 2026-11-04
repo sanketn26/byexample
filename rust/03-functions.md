@@ -1,45 +1,76 @@
 # Rust 03 — Functions and Closures
 
-Functions are declared with `fn`, parameter and return types are always
-written out, and the last expression (without a semicolon) is the return
-value. Closures capture their environment and come in three flavours:
-`Fn`, `FnMut` and `FnOnce`.
+A function is `fn`, and every parameter and return type is written out.
+The last expression, with no semicolon, is the return value. A closure
+captures the names around it. It is `Fn`, `FnMut`, or `FnOnce` depending
+on how it uses those names.
 
-## Example
+## The last expression is the return value
 
-```rust file=example.rs
+There is no `return` required. A stray semicolon on that line turns the
+value into `()`, and the compiler points at the `;`. There are no default
+arguments and no overloading. Use an `Option` parameter, a builder, or a
+second function name.
+
+```rust file=n01.rs
 fn add(a: i32, b: i32) -> i32 {
-    a + b // no semicolon: this is the return value
+    a + b
 }
 
+fn main() {
+    println!("{}", add(2, 3));
+}
+```
+
+```text output
+5
+```
+
+## A tuple returns more than one value
+
+The caller destructures it. Division here is the truncating kind from
+lesson 01.
+
+```rust file=n02.rs
 fn divmod(a: i32, b: i32) -> (i32, i32) {
     (a / b, a % b)
 }
 
-// Borrow a slice instead of taking ownership of a Vec
+fn main() {
+    let (q, r) = divmod(17, 5);
+    println!("{q} {r}");
+}
+```
+
+```text output
+3 2
+```
+
+## Take a slice, not a `Vec`
+
+`&[T]` accepts a vector, an array, or any other slice, and it does not take
+ownership. Prefer `&[T]` over `&Vec<T>` and `&str` over `&String`.
+
+```rust file=n03.rs
 fn sum(xs: &[i32]) -> i32 {
     xs.iter().sum()
 }
 
-// Returning a closure that owns mutable state
-fn make_counter() -> impl FnMut() -> u32 {
-    let mut c = 0;
-    move || {
-        c += 1;
-        c
-    }
+fn main() {
+    println!("{}", sum(&[1, 2, 3, 4]));
 }
+```
 
-// Different closure types behind one type: a trait object
-fn make_adder(n: i32) -> Box<dyn Fn(i32) -> i32> {
-    Box::new(move |x| x + n)
-}
+```text output
+10
+```
 
-fn apply<F: Fn(i32) -> i32>(f: F, x: i32) -> i32 {
-    f(x)
-}
+## A bound names what the function uses
 
-// Generics with a trait bound
+`T: PartialOrd + Copy` means the values can be ordered and copied out of
+the slice. The function works for any type that can do both.
+
+```rust file=n04.rs
 fn largest<T: PartialOrd + Copy>(xs: &[T]) -> T {
     let mut m = xs[0];
     for &x in xs {
@@ -50,12 +81,46 @@ fn largest<T: PartialOrd + Copy>(xs: &[T]) -> T {
     m
 }
 
-// Evaluated at compile time
+fn main() {
+    println!(
+        "{} {:.1} {}",
+        largest(&[3, 9, 2]),
+        largest(&[1.5, 0.2]),
+        largest(&['a', 'z', 'm'])
+    );
+}
+```
+
+```text output
+9 1.5 z
+```
+
+## `const fn` runs at compile time
+
+A const function can initialize a `const`. The call happens while the
+program is compiled, not when `main` runs.
+
+```rust file=n05.rs
 const fn square(n: u32) -> u32 {
     n * n
 }
 const SQ: u32 = square(12);
 
+fn main() {
+    println!("{SQ}");
+}
+```
+
+```text output
+144
+```
+
+## Recursion has no tail-call guarantee
+
+This Fibonacci is clear and fine for a small `n`. Deep recursion overflows
+the stack. Prefer a loop when the depth is unbounded.
+
+```rust file=n06.rs
 fn fib(n: u32) -> u64 {
     match n {
         0 => 0,
@@ -65,79 +130,174 @@ fn fib(n: u32) -> u64 {
 }
 
 fn main() {
-    println!("{}", add(2, 3));
-    let (q, r) = divmod(17, 5);
-    println!("{q} {r}");
-    println!("{}", sum(&[1, 2, 3, 4]));
+    println!("{}", fib(20));
+}
+```
 
+```text output
+6765
+```
+
+## `impl FnMut` returns one hidden closure
+
+The closure owns a counter because of `move`. `impl Trait` in return
+position names exactly one concrete type, which the caller cannot write
+down. A `FnMut` value must be `let mut` to be called.
+
+```rust file=n07.rs
+fn make_counter() -> impl FnMut() -> u32 {
+    let mut c = 0;
+    move || {
+        c += 1;
+        c
+    }
+}
+
+fn main() {
     let mut c = make_counter();
     let (c1, c2, c3) = (c(), c(), c());
     println!("{c1} {c2} {c3}");
+}
+```
 
+```text output
+1 2 3
+```
+
+## `Box<dyn Fn>` erases different closures
+
+Two branches cannot return two different closure types through `impl Fn`.
+Box them as `dyn Fn` when the closure is chosen at run time. Closures
+capture by the least mode that works: shared borrow, mutable borrow, or
+move. `move` forces the ownership transfer, which you need when the
+closure outlives the current scope.
+
+```rust file=n08.rs
+fn make_adder(n: i32) -> Box<dyn Fn(i32) -> i32> {
+    Box::new(move |x| x + n)
+}
+
+fn pick(even: bool) -> Box<dyn Fn(i32) -> i32> {
+    if even {
+        Box::new(|x| x * 2)
+    } else {
+        Box::new(|x| x + 1)
+    }
+}
+
+fn apply<F: Fn(i32) -> i32>(f: F, x: i32) -> i32 {
+    f(x)
+}
+
+fn main() {
     let add5 = make_adder(5);
     println!("{}", apply(&add5, 10));
     println!("{}", apply(|x| x * x, 7));
+    println!("{} {}", pick(true)(3), pick(false)(3));
+}
+```
 
-    println!("{} {:.1} {}", largest(&[3, 9, 2]), largest(&[1.5, 0.2]), largest(&['a', 'z', 'm']));
-    println!("{SQ} {}", fib(20));
+```text output
+15
+49
+6 4
+```
 
-    // FnMut: mutates captured state
+## `FnMut` changes what it captured
+
+The closure pushes into `log`, so calling it needs a mutable binding.
+Shared `Fn` would not be allowed to do that.
+
+```rust file=n09.rs
+fn main() {
     let mut log = Vec::new();
     let mut record = |s: &str| log.push(s.to_uppercase());
     record("a");
     record("b");
     println!("{log:?}");
+}
+```
 
-    // FnOnce: consumes a captured value
+```text output
+["A", "B"]
+```
+
+## `FnOnce` consumes a captured value
+
+After the closure returns the `String`, that value is gone, so the closure
+cannot run a second time.
+
+```rust file=n10.rs
+fn main() {
     let name = String::from("ferris");
     let consume = move || name;
     println!("{}", consume());
+}
+```
 
-    // Plain function pointers: fn(i32, i32) -> i32
+```text output
+ferris
+```
+
+## A function pointer is a type you can name
+
+`fn(i32, i32) -> i32` is a pointer to a function, not a trait. A closure
+that captures nothing coerces to one. A closure that captures does not.
+
+```rust file=n11.rs
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn main() {
     let ops: [(&str, fn(i32, i32) -> i32); 2] = [("add", add), ("mul", |a, b| a * b)];
     for (n, f) in ops {
         print!("{n}={} ", f(3, 4));
     }
     println!();
+}
+```
 
-    // Iterator chains replace most loops
+```text output
+add=7 mul=12 
+```
+
+## Iterators replace most loops
+
+`filter`, `map`, and `collect` build a new collection without an index.
+The range `1..=6` includes 6.
+
+```rust file=n12.rs
+fn main() {
     let evens_sq: Vec<i32> = (1..=6).filter(|n| n % 2 == 0).map(|n| n * n).collect();
     println!("{evens_sq:?}");
 }
 ```
 
 ```text output
-5
-3 2
-10
-1 2 3
-15
-49
-9 1.5 z
-144 6765
-["A", "B"]
-ferris
-add=7 mul=12 
 [4, 16, 36]
 ```
 
-## Details that bite
+## A missing argument is an `Option`
 
-- A stray semicolon on the last line turns the return value into `()` and
-  produces a type error — read the message, it points to the `;`.
-- Closures capture by the *least* needed mode (shared borrow, mutable
-  borrow, or move). `move` forces ownership transfer; you need it when the
-  closure outlives the current scope (threads, returned closures).
-- `impl Trait` in return position names *one* concrete hidden type. To
-  return different closures from different branches, use
-  `Box<dyn Fn…>`.
-- A `FnMut` closure must be declared `let mut` to be called.
-- Recursion has no tail-call guarantee; deep recursion overflows the stack.
-  Prefer iteration for unbounded depth.
-- There are no default arguments or overloading. Use `Option<T>` params,
-  builder structs, or distinct names.
-- Prefer `&[T]` over `&Vec<T>` and `&str` over `&String` for parameters:
-  they accept more, and cost nothing.
+There is no default-argument syntax. `Option` is the parameter that
+may be absent. `unwrap_or` supplies the fallback at the use site.
+
+```rust file=n13.rs
+fn greet(name: Option<&str>) -> String {
+    format!("hello {}", name.unwrap_or("stranger"))
+}
+
+fn main() {
+    println!("{}", greet(None));
+    println!("{}", greet(Some("Ada")));
+}
+```
+
+```text output
+hello stranger
+hello Ada
+```
 
 ## Exercises
 

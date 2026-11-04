@@ -1,18 +1,25 @@
 # Rust 12 — Idiomatic Rust
 
-Idiomatic Rust leans on the type system: iterators instead of index loops,
-`Option`/`Result` combinators instead of sentinel values, ownership in
-signatures that say what they mean, and types that make invalid states
-unrepresentable. Most of this is what `cargo clippy` nudges you towards.
+Idiomatic Rust pushes work into the type system. Iterators instead of index
+loops. `Option` and `Result` instead of sentinel values. Signatures that say
+what they borrow. Types that cannot represent an illegal state. `cargo fmt`
+and `cargo clippy -- -D warnings` are the shared style guide. Run both in
+CI. Clippy is sometimes wrong: `#[allow(clippy::lint)]` with a comment that
+says why is fine.
 
-## Example
+Prefer a small function with a name over a long one whose comments are the
+headings. Prefer composition and a trait over a generic with six type
+parameters. `#[must_use]`, `#[non_exhaustive]`, and `pub(crate)` keep an API
+honest. Reach for crates for what `std` leaves out: `serde`, `clap`,
+`anyhow` or `thiserror`, `tokio`, `rayon`, `itertools`.
 
-```rust file=example.rs
-use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
+## An iterator says the same thing as the index loop
 
-// 1. Iterator pipelines instead of manual index loops
+`for i in 0..v.len() { v[i] }` is the C habit. `filter` and `map` name the
+steps, and they cannot walk off the end. `for x in &v` is the form in
+between.
+
+```rust file=n01.rs
 fn sum_even_squares_c_style(xs: &[i32]) -> i32 {
     let mut total = 0;
     let mut i = 0;
@@ -29,12 +36,47 @@ fn sum_even_squares(xs: &[i32]) -> i32 {
     xs.iter().filter(|&&x| x % 2 == 0).map(|&x| x * x).sum()
 }
 
-// 2. Accept the most general borrowed type: &str, &[T], not &String, &Vec<T>
+fn main() {
+    let xs = [1, 2, 3, 4];
+    println!("{} {}", sum_even_squares_c_style(&xs), sum_even_squares(&xs));
+}
+```
+
+```text output
+20 20
+```
+
+## Take `&str`, not `&String`
+
+A `&str` parameter accepts a literal, a slice, or a `&String`. A `&String`
+parameter accepts only the owned kind. The same rule is `&[T]` instead of
+`&Vec<T>`. Read-only text does not need an owned `String`, and it does not
+need `impl AsRef<str>` unless several string-like types must work.
+
+```rust file=n02.rs
 fn count_a(s: &str) -> usize {
     s.chars().filter(|&c| c == 'a').count()
 }
 
-// 3. Option combinators instead of nested matches
+fn main() {
+    let owned = String::from("banana");
+    println!("{} {}", count_a("banana"), count_a(&owned));
+}
+```
+
+```text output
+3 3
+```
+
+## Combinators replace the nested match
+
+`and_then`, `map`, and `unwrap_or_else` are the match you would have
+written: look inside, transform, or substitute a default. `if x.is_some() {
+x.unwrap() }` is `if let Some(x) = x`. A sentinel such as `""` or `-1` is
+usually an `Option` that forgot its type. `x.clone()` to silence the borrow
+checker is the last resort. Restructure, or borrow something smaller.
+
+```rust file=n03.rs
 fn user_domain(email: Option<&str>) -> String {
     email
         .and_then(|e| e.split_once('@'))
@@ -42,12 +84,41 @@ fn user_domain(email: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-// 4. `?` instead of match-and-return
+fn main() {
+    println!("{} {}", user_domain(Some("Ann@Example.com")), user_domain(None));
+}
+```
+
+```text output
+example.com unknown
+```
+
+## `?` replaces match-and-return
+
+In library code, return the `Result`. `unwrap` belongs in a test or in
+`main` after you have decided the failure is fatal.
+
+```rust file=n04.rs
 fn parse_sum(a: &str, b: &str) -> Result<i32, std::num::ParseIntError> {
     Ok(a.parse::<i32>()? + b.parse::<i32>()?)
 }
 
-// 5. let-else keeps the happy path unindented
+fn main() {
+    println!("{:?} {}", parse_sum("3", "4"), parse_sum("3", "x").is_err());
+}
+```
+
+```text output
+Ok(7) true
+```
+
+## `let else` keeps the happy path flat
+
+The `else` arm must diverge: `return`, `break`, or `panic`. The rest of the
+function then uses the unwrapped value with no extra indent. Returning a
+tuple or a struct beats an `&mut` out-parameter.
+
+```rust file=n05.rs
 fn first_char_upper(s: &str) -> String {
     let Some(c) = s.chars().next() else {
         return String::new();
@@ -55,7 +126,23 @@ fn first_char_upper(s: &str) -> String {
     c.to_uppercase().collect()
 }
 
-// 6. The entry API instead of get/insert dances
+fn main() {
+    println!("{:?} {:?}", first_char_upper("hello"), first_char_upper(""));
+}
+```
+
+```text output
+"H" ""
+```
+
+## `entry` updates or inserts in one step
+
+`or_insert` yields a mutable reference to the value that is already there,
+or to the one it just inserted. No separate `get` and `insert`.
+
+```rust file=n06.rs
+use std::collections::HashMap;
+
 fn count_chars(s: &str) -> HashMap<char, usize> {
     let mut m = HashMap::new();
     for c in s.chars() {
@@ -64,7 +151,25 @@ fn count_chars(s: &str) -> HashMap<char, usize> {
     m
 }
 
-// 7. Builder with `impl Into<String>` and Default
+fn main() {
+    let mut counts: Vec<_> = count_chars("banana").into_iter().collect();
+    counts.sort();
+    println!("{counts:?}");
+}
+```
+
+```text output
+[('a', 3), ('b', 1), ('n', 2)]
+```
+
+## A builder owns the options
+
+`new` takes `impl Into<String>`, so a literal or a `String` both work.
+Each setter consumes `self` and returns it, which is what makes the chain
+compile. `Default` is derived, not written by hand. The fields stay private.
+A pile of `bool` parameters would be this struct, or an enum, instead.
+
+```rust file=n07.rs
 #[derive(Debug, Default)]
 struct Request {
     url: String,
@@ -74,7 +179,11 @@ struct Request {
 
 impl Request {
     fn new(url: impl Into<String>) -> Self {
-        Request { url: url.into(), method: "GET".into(), ..Default::default() }
+        Request {
+            url: url.into(),
+            method: "GET".into(),
+            ..Default::default()
+        }
     }
     fn method(mut self, m: &str) -> Self {
         self.method = m.to_string();
@@ -89,7 +198,23 @@ impl Request {
     }
 }
 
-// 8. Newtypes + From make units explicit
+fn main() {
+    let req = Request::new("http://x").method("POST").retries(3);
+    println!("{req:?} {}", req.describe());
+}
+```
+
+```text output
+Request { url: "http://x", method: "POST", retries: 3 } POST http://x x3
+```
+
+## A newtype makes the unit part of the type
+
+`Feet` will not compile where `Meters` is required. `From` is the conversion
+you opted into. `as` is the wrong tool for a fallible numeric conversion.
+`try_from` fails when the value does not fit.
+
+```rust file=n08.rs
 struct Meters(f64);
 struct Feet(f64);
 
@@ -99,9 +224,32 @@ impl From<Feet> for Meters {
     }
 }
 
-// 9. Type-state: invalid transitions do not compile
+fn main() {
+    println!("{:.3}", Meters::from(Feet(10.0)).0);
+    println!("{:?} {:?}", u8::try_from(44i32).ok(), u8::try_from(300i32).ok());
+}
+```
+
+```text output
+3.048
+Some(44) None
+```
+
+## Type-state makes the illegal call a type error
+
+A closed door has no `walk_through`. An open door has no `open` again. The
+state is a type parameter with no runtime data (`PhantomData`). That is
+"parse, don't validate" applied to a sequence: bad states are not
+representable, so a stringly flag never has to be checked. `Box<dyn Trait>`
+is the wrong default for this. A generic, or a distinct type, is free.
+Dynamic dispatch is for a heterogeneous collection.
+
+```rust file=n09.rs
+use std::marker::PhantomData;
+
 struct Open;
 struct Closed;
+
 struct Door<State> {
     _state: PhantomData<State>,
 }
@@ -124,7 +272,24 @@ impl Door<Open> {
     }
 }
 
-// 10. Implement Display instead of ad-hoc to_string functions
+fn main() {
+    println!("{}", Door::new().open().close().open().walk_through());
+}
+```
+
+```text output
+through the open door
+```
+
+## `Display` is the text, not an ad-hoc method
+
+Implement `Display` and you get `to_string` and `{}`. Document the type with
+`///` comments. A code block in one of those comments is a doctest: `cargo
+test` compiles it, so the example cannot rot quietly.
+
+```rust file=n10.rs
+use std::fmt;
+
 struct Pt(i32, i32);
 
 impl fmt::Display for Pt {
@@ -134,106 +299,160 @@ impl fmt::Display for Pt {
 }
 
 fn main() {
-    let xs = [1, 2, 3, 4];
-    println!("1 {} {}", sum_even_squares_c_style(&xs), sum_even_squares(&xs));
-    println!("2 {}", count_a("banana"));
-    println!("3 {} {}", user_domain(Some("Ann@Example.com")), user_domain(None));
-    println!("4 {:?} {}", parse_sum("3", "4"), parse_sum("3", "x").is_err());
-    println!("5 {:?} {:?}", first_char_upper("hello"), first_char_upper(""));
-
-    let mut counts: Vec<_> = count_chars("banana").into_iter().collect();
-    counts.sort();
-    println!("6 {counts:?}");
-
-    let req = Request::new("http://x").method("POST").retries(3);
-    println!("7 {:?} {}", req, req.describe());
-    println!("8 {:.3}", Meters::from(Feet(10.0)).0);
-    println!("9 {}", Door::new().open().close().open().walk_through());
-    println!("10 {} {}", Pt(1, 2), Pt(1, 2).to_string().len());
-
-    // 11. collect() builds whatever you ask for
-    let lens: HashMap<&str, usize> = ["a", "bb"].iter().map(|w| (*w, w.len())).collect();
-    let joined: String = ['h', 'i'].iter().collect();
-    let opt = ["1", "2"].iter().map(|s| s.parse().ok()).collect::<Option<Vec<i32>>>();
-    println!("11 {joined} {opt:?} {}", lens["bb"]);
-
-    // 12. position / any / all
-    let odds = [1, 5, 9];
-    println!(
-        "12 {:?} {} {}",
-        odds.iter().position(|&x| x == 5),
-        odds.iter().any(|&x| x > 8),
-        odds.iter().all(|&x| x % 2 == 1)
-    );
-
-    // 13. mem::take moves a value out of a &mut, leaving Default behind
-    let mut name = String::from("x");
-    let old = std::mem::take(&mut name);
-    println!("13 {old:?} {name:?}");
-
-    // 14. sort_by_key with a tuple key and Reverse
-    let mut people = vec![("Al", 30), ("Bo", 25), ("Cy", 30)];
-    people.sort_by_key(|&(name, age)| (std::cmp::Reverse(age), name));
-    println!("14 {people:?}");
+    println!("{} {}", Pt(1, 2), Pt(1, 2).to_string().len());
 }
 ```
 
 ```text output
-1 20 20
-2 3
-3 example.com unknown
-4 Ok(7) true
-5 "H" ""
-6 [('a', 3), ('b', 1), ('n', 2)]
-7 Request { url: "http://x", method: "POST", retries: 3 } POST http://x x3
-8 3.048
-9 through the open door
-10 (1, 2) 6
-11 hi Some([1, 2]) 2
-12 Some(1) true true
-13 "x" ""
-14 [("Al", 30), ("Cy", 30), ("Bo", 25)]
+(1, 2) 6
 ```
 
-## The checklist
+## `collect` builds the collection you name
 
-| Instead of | Write |
-|------------|-------|
-| `for i in 0..v.len() { v[i] }` | `for x in &v` / `iter().enumerate()` |
-| `fn f(s: &String)`, `fn f(v: &Vec<T>)` | `fn f(s: &str)`, `fn f(v: &[T])` |
-| `if x.is_some() { x.unwrap() }` | `if let Some(x) = x` |
-| `match opt { Some(x) => Some(f(x)), None => None }` | `opt.map(f)` |
-| `return Err(e)` after a match | `?` |
-| `x.clone()` to silence the borrow checker | restructure, or borrow smaller |
-| `unwrap()` in library code | return `Result`/`Option` |
-| `String` params you only read | `&str` (or `impl AsRef<str>`) |
-| `Box<dyn Trait>` everywhere | generics (`impl Trait`) unless you need dynamic dispatch |
-| Sentinel values (`-1`, `""`) | `Option<T>` |
-| Stringly-typed enums and flags | `enum` with `match` |
-| Manual `Default`/`Debug`/`PartialEq` | `#[derive(...)]` |
-| Public fields guarded by comments | private fields + constructor |
-| Many `bool` parameters | an enum or options struct |
-| `&mut` out-parameters | return a tuple or struct |
-| Long functions with comments as headings | small functions with names |
-| `as` casts for fallible conversions | `try_from` / `try_into` |
+The same iterator becomes a `HashMap`, a `String`, or an `Option<Vec<_>>`.
+The `Option` form is `None` if any element is `None`.
 
-## Details that bite
+```rust file=n11.rs
+use std::collections::HashMap;
 
-- `cargo fmt` and `cargo clippy -- -D warnings` are the community's shared
-  style guide. Run both in CI.
-- Prefer composition and traits over deep generics; a generic function
-  with six type parameters is a sign to introduce a struct or a trait.
-- Make illegal states unrepresentable (enums with data instead of a struct
-  of `Option`s), and push validation into constructors (`parse, don't
-  validate`).
-- Document with `///` comments; code blocks inside them are compiled and
-  run by `cargo test` (doctests), so examples never go stale.
-- `#[must_use]`, `#[non_exhaustive]` and `pub(crate)` keep APIs
-  honest and small.
-- Use crates for what the standard library deliberately omits: `serde`,
-  `clap`, `anyhow`/`thiserror`, `tokio`, `rayon`, `itertools`.
-- Clippy is sometimes wrong; `#[allow(clippy::lint)]` with a comment
-  explaining why is fine.
+fn main() {
+    let lens: HashMap<&str, usize> = ["a", "bb"].iter().map(|w| (*w, w.len())).collect();
+    let joined: String = ['h', 'i'].iter().collect();
+    let opt = ["1", "2"].iter().map(|s| s.parse().ok()).collect::<Option<Vec<i32>>>();
+    println!("{joined} {opt:?} {}", lens["bb"]);
+}
+```
+
+```text output
+hi Some([1, 2]) 2
+```
+
+## `position`, `any`, and `all` are the early-exit loops
+
+`position` returns the index. `any` and `all` stop as soon as the answer is
+known.
+
+```rust file=n12.rs
+fn main() {
+    let odds = [1, 5, 9];
+    println!(
+        "{:?} {} {}",
+        odds.iter().position(|&x| x == 5),
+        odds.iter().any(|&x| x > 8),
+        odds.iter().all(|&x| x % 2 == 1)
+    );
+}
+```
+
+```text output
+Some(1) true true
+```
+
+## `mem::take` moves out of a mutable borrow
+
+It leaves `Default::default()` in place. For a `String`, that is empty. You
+do not clone, and you do not need to own the container.
+
+```rust file=n13.rs
+fn main() {
+    let mut name = String::from("x");
+    let old = std::mem::take(&mut name);
+    println!("{old:?} {name:?}");
+}
+```
+
+```text output
+"x" ""
+```
+
+## A tuple key sorts by more than one field
+
+`Reverse(age)` is descending age. The name is the tie break, ascending.
+`sort_by_key` calls the closure once per element.
+
+```rust file=n14.rs
+fn main() {
+    let mut people = vec![("Al", 30), ("Bo", 25), ("Cy", 30)];
+    people.sort_by_key(|&(name, age)| (std::cmp::Reverse(age), name));
+    println!("{people:?}");
+}
+```
+
+```text output
+[("Al", 30), ("Cy", 30), ("Bo", 25)]
+```
+
+## `must_use` and `non_exhaustive` are part of the signature
+
+Throwing away a `#[must_use]` value is a warning. `#[non_exhaustive]` means
+another crate's `match` needs a wildcard, so you can add a variant later
+without breaking that crate's build. Inside this crate the match can still
+be exhaustive. `pub(crate)` keeps a helper visible to the crate and hidden
+outside it.
+
+```rust file=n15.rs
+#[must_use]
+fn answer() -> i32 {
+    42
+}
+
+#[non_exhaustive]
+enum Color {
+    Red,
+}
+
+pub(crate) fn label(c: Color) -> &'static str {
+    match c {
+        Color::Red => "red",
+    }
+}
+
+fn main() {
+    println!("{} {}", answer(), label(Color::Red));
+}
+```
+
+```text output
+42 red
+```
+
+## `parse` returns a `Result`
+
+`"42".parse::<i32>()` is how a string becomes a number. A bad string is
+`Err`, so the caller decides what a typo means.
+
+```rust file=n16.rs
+fn main() {
+    let n: i32 = "42".parse().unwrap();
+    let bad = "no".parse::<i32>();
+    println!("{n} {}", bad.is_err());
+}
+```
+
+```text output
+42 true
+```
+
+## A missing environment variable has a default
+
+`env::var` returns `Err` when the name is unset. `unwrap_or_else`
+supplies the fallback at that point.
+
+```rust file=n17.rs
+use std::env;
+
+fn main() {
+    // SAFETY: this example sets the variable in this process only.
+    unsafe { env::set_var("APP_PORT", "8080") };
+    let port = env::var("APP_PORT").unwrap_or_else(|_| "80".into());
+    let missing = env::var("APP_MISSING").unwrap_or_else(|_| "80".into());
+    println!("{port} {missing}");
+}
+```
+
+```text output
+8080 80
+```
 
 ## Exercises
 

@@ -1,28 +1,50 @@
 # Go 03 — Functions
 
-Functions are values, can return multiple results, and can be generic. `defer`
-schedules cleanup that runs when the surrounding function returns.
+Functions are values, can return multiple results, and can be generic.
+`defer` schedules a call that runs when the surrounding function returns.
+There are no default or keyword arguments: pass every value, or take a
+variadic list.
 
-## Example
+## Several results can be named
 
-```go file=example.go
+Named results are ordinary variables, already zeroed, and they document the
+return. A bare `return` sends them back. Keep that form to short functions.
+
+```go file=n01.go
 package main
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
 func add(a, b int) int { return a + b }
 
-// Multiple results; named results act as documentation (and variables).
 func divmod(a, b int) (q, r int) {
 	q = a / b
 	r = a % b
-	return // "naked" return: fine in short functions only
+	return
 }
 
-// Variadic: nums is a []int inside the function.
+func main() {
+	fmt.Println(add(2, 3))
+	q, r := divmod(17, 5)
+	fmt.Println(q, r)
+}
+```
+
+```text output
+5
+3 2
+```
+
+## Variadic arguments arrive as a slice
+
+Inside the function, `nums ...int` is a `[]int`. Callers pass values one by
+one, or unpack a slice with `...`.
+
+```go file=n02.go
+package main
+
+import "fmt"
+
 func sum(nums ...int) int {
 	t := 0
 	for _, n := range nums {
@@ -31,7 +53,25 @@ func sum(nums ...int) int {
 	return t
 }
 
-// Closures capture variables by reference.
+func main() {
+	fmt.Println(sum(), sum(1, 2, 3), sum([]int{4, 5}...))
+}
+```
+
+```text output
+0 6 9
+```
+
+## Closures capture variables, not copies
+
+The returned function shares `c` with the scope that created it. Each call
+sees the latest value.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
 func counter() func() int {
 	c := 0
 	return func() int {
@@ -40,12 +80,63 @@ func counter() func() int {
 	}
 }
 
-// Function types give names to signatures.
+func main() {
+	c := counter()
+	fmt.Println(c(), c(), c())
+}
+```
+
+```text output
+1 2 3
+```
+
+## A function value has a type
+
+A named signature such as `Op` is what you store in a map or pass around.
+Functions compare equal only to `nil`; two non-nil functions are not
+comparable.
+
+```go file=n04.go
+package main
+
+import "fmt"
+
 type Op func(int, int) int
 
 func apply(op Op, a, b int) int { return op(a, b) }
 
-// Generics (Go 1.18+): type parameters with constraints.
+func add(a, b int) int { return a + b }
+
+func main() {
+	var missing Op
+	ops := map[string]Op{
+		"add": add,
+		"mul": func(a, b int) int { return a * b },
+	}
+	fmt.Println(apply(ops["add"], 2, 3), apply(ops["mul"], 2, 3))
+	fmt.Println(missing == nil)
+}
+```
+
+```text output
+5 6
+true
+```
+
+## Type parameters constrain generics
+
+The names in `[T, U any]` stand for types the caller supplies. A constraint
+such as `Ordered` lists the types (and their underlying types, via `~`)
+that the body may use.
+
+```go file=n05.go
+package main
+
+import (
+	"fmt"
+	"strings"
+)
+
 func Map[T, U any](xs []T, f func(T) U) []U {
 	out := make([]U, 0, len(xs))
 	for _, x := range xs {
@@ -65,7 +156,58 @@ func Max[T Ordered](a, b T) T {
 	return b
 }
 
-// defer runs LIFO when the function returns; arguments are evaluated now.
+func main() {
+	fmt.Println(Map([]int{1, 2, 3}, func(i int) string { return strings.Repeat("*", i) }))
+	fmt.Println(Max(3, 7), Max("a", "b"))
+}
+```
+
+```text output
+[* ** ***]
+7 b
+```
+
+## Arguments are copied
+
+The callee receives a copy of each argument. A slice, map, or channel copy
+is only the small header, so writes through it are visible to the caller.
+Reassigning the parameter is not.
+
+```go file=n06.go
+package main
+
+import "fmt"
+
+func mutate(s []int, m map[string]int) {
+	s[0] = 9
+	m["a"] = 1
+	s = []int{7}
+	m = map[string]int{"b": 2}
+}
+
+func main() {
+	s := []int{1}
+	m := map[string]int{}
+	mutate(s, m)
+	fmt.Println(s, m)
+}
+```
+
+```text output
+[9] map[a:1]
+```
+
+## `defer` runs when the function returns
+
+Deferred calls run last-in, first-out, after the rest of the function, not
+at the end of the loop iteration. Wrap the body in a function literal when
+cleanup has to run each time around.
+
+```go file=n07.go
+package main
+
+import "fmt"
+
 func deferDemo() {
 	fmt.Println("start")
 	for i := 0; i < 3; i++ {
@@ -74,11 +216,107 @@ func deferDemo() {
 	fmt.Println("end")
 }
 
-// A deferred closure may modify named results.
+func main() {
+	deferDemo()
+}
+```
+
+```text output
+start
+end
+deferred 2
+deferred 1
+deferred 0
+```
+
+## `defer` arguments are evaluated immediately
+
+The values passed to a deferred call are computed at the `defer` line. The
+call itself waits.
+
+```go file=n08.go
+package main
+
+import "fmt"
+
+func main() {
+	x := 1
+	defer fmt.Println("later", x)
+	x = 2
+	fmt.Println("now", x)
+}
+```
+
+```text output
+now 2
+later 1
+```
+
+## A deferred function can change named results
+
+The deferred call runs after `return 21` has stored `21` in `n`, and it
+may still assign to that name.
+
+```go file=n09.go
+package main
+
+import "fmt"
+
 func double() (n int) {
 	defer func() { n *= 2 }()
 	return 21
 }
+
+func main() {
+	fmt.Println(double())
+}
+```
+
+```text output
+42
+```
+
+## `:=` can shadow a named result
+
+A named result is already declared. `:=` in an inner block creates a new
+variable and leaves the result untouched. Assign with `=` when you mean
+the result.
+
+```go file=n10.go
+package main
+
+import (
+	"errors"
+	"fmt"
+)
+
+func parse() (n int, err error) {
+	{
+		n, err := 7, errors.New("boom")
+		fmt.Println("inner", n, err)
+	}
+	return
+}
+
+func main() {
+	fmt.Println(parse())
+}
+```
+
+```text output
+inner 7 boom
+0 <nil>
+```
+
+## Recursion is an ordinary call
+
+The function calls itself with a smaller argument. There is no special
+keyword. The base case returns before the calls.
+
+```go file=n11.go
+package main
+
+import "fmt"
 
 func fib(n int) int {
 	if n < 2 {
@@ -88,65 +326,33 @@ func fib(n int) int {
 }
 
 func main() {
-	fmt.Println(add(2, 3))
-	q, r := divmod(17, 5)
-	fmt.Println(q, r)
-	fmt.Println(sum(), sum(1, 2, 3), sum([]int{4, 5}...))
-
-	c := counter()
-	fmt.Println(c(), c(), c())
-
-	ops := map[string]Op{
-		"add": add,
-		"mul": func(a, b int) int { return a * b },
-	}
-	fmt.Println(apply(ops["add"], 2, 3), apply(ops["mul"], 2, 3))
-
-	fmt.Println(Map([]int{1, 2, 3}, func(i int) string { return strings.Repeat("*", i) }))
-	fmt.Println(Max(3, 7), Max("a", "b"))
-
-	deferDemo()
-	fmt.Println(double())
 	fmt.Println(fib(10))
+}
+```
 
-	// Immediately invoked function literal
+```text output
+55
+```
+
+## A function literal can run at once
+
+Parentheses after the closing brace call the function before the statement
+ends. It is the same as binding a name and calling it on the next line.
+
+```go file=n12.go
+package main
+
+import "fmt"
+
+func main() {
 	msg := func(name string) string { return "hi " + name }("go")
 	fmt.Println(msg)
 }
 ```
 
 ```text output
-5
-3 2
-0 6 9
-1 2 3
-5 6
-[* ** ***]
-7 b
-start
-end
-deferred 2
-deferred 1
-deferred 0
-42
-55
 hi go
 ```
-
-## Details that bite
-
-- Arguments are **always passed by value**. Slices, maps and channels are
-  small headers that point at shared data, so mutation through them is
-  visible to the caller — but reassigning the parameter is not.
-- `defer` in a loop piles up until the *function* ends, not the iteration.
-  Wrap the body in a function literal if you need per-iteration cleanup.
-- Deferred call arguments are evaluated at the `defer` statement:
-  `defer fmt.Println(x)` prints the value `x` had then.
-- Named results are zero-initialised and shadowing them with `:=` inside an
-  inner block is a classic bug (`err := …` hides the named `err`).
-- Functions are not comparable except to `nil`.
-- There are no default or keyword arguments. Use option structs or
-  functional options.
 
 ## Exercises
 

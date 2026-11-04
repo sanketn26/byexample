@@ -1,23 +1,100 @@
 # Python 16 — Network programming
 
-TCP gives you the stream from the previous lesson, with a peer on the
-other end. Bind `127.0.0.1` and port `0` and the kernel picks a free port.
-A length-prefixed frame is the smallest protocol that survives short reads.
-HTTP/1.1 is that idea plus text headers. `asyncio` streams are the same
-reads, scheduled on one thread.
+TCP gives you a stream of bytes, with a peer on the other end. Bind
+`127.0.0.1` and port `0` and the kernel picks a free port. A length-prefixed
+frame is the smallest protocol that survives a short read. HTTP/1.1 is that
+idea plus text headers. `asyncio` streams are the same reads, scheduled on
+one thread. Nothing here is TLS, HTTP/2, or a public address. Those sit on
+this loop. `requests` is a third-party wrapper around it, and it blocks the
+asyncio loop.
 
-## Example
+## One byte is a successful read
 
-```python file=example.py
-import asyncio
+`recv` returns what has arrived. Ask for one byte and you get one byte
+even when more is already queued. `b""` means the peer closed. That is a
+clean end only when you have not already started a frame.
+
+```python file=n01.py
+import socket
+
+a, b = socket.socketpair()
+b.sendall(b"xy")
+print(a.recv(1), a.recv(8))
+b.close()
+print(repr(a.recv(8)))
+a.close()
+```
+
+```text output
+b'x' b'y'
+b''
+```
+
+## Loop until the frame is complete
+
+The header is a big-endian `uint32` length of the body. `read_full` keeps
+calling `recv` until it has that many bytes. A split send still decodes
+as one payload.
+
+```python file=n02.py
+import socket
+import struct
+
+
+def frame(payload):
+    return struct.pack(">I", len(payload)) + payload
+
+
+def read_full(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            if not buf:
+                return None
+            raise EOFError(f"got {len(buf)} of {n}")
+        buf += chunk
+    return bytes(buf)
+
+
+def read_frame(sock):
+    header = read_full(sock, 4)
+    if header is None:
+        return None
+    (n,) = struct.unpack(">I", header)
+    body = read_full(sock, n)
+    if body is None:
+        raise EOFError("truncated frame")
+    return body
+
+
+a, b = socket.socketpair()
+raw = frame(b"hello")
+b.sendall(raw[:1])
+b.sendall(raw[1:])
+print(read_frame(a))
+b.close()
+print(read_frame(a))
+a.close()
+```
+
+```text output
+b'hello'
+None
+```
+
+## Bind port 0 and echo one frame
+
+The kernel chooses the port. The server reads one frame and writes it
+back in upper case. The client speaks the same framing.
+
+```python file=n03.py
 import socket
 import struct
 import threading
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def frame(payload: bytes) -> bytes:
+def frame(payload):
     return struct.pack(">I", len(payload)) + payload
 
 
@@ -50,19 +127,158 @@ def serve(port_out):
     ls.bind(("127.0.0.1", 0))
     ls.listen()
     port_out.append(ls.getsockname()[1])
-    for mode in ("echo", "silent", "drop"):
+    conn, _ = ls.accept()
+    try:
+        conn.sendall(frame(read_frame(conn).upper()))
+    finally:
+        conn.close()
+        ls.close()
+
+
+port_out = []
+thread = threading.Thread(target=serve, args=(port_out,))
+thread.start()
+while not port_out:
+    pass
+sock = socket.create_connection(("127.0.0.1", port_out[0]), timeout=2)
+sock.sendall(frame(b"ping"))
+print("frame", read_frame(sock).decode())
+sock.close()
+thread.join()
+```
+
+```text output
+frame PING
+```
+
+## A timeout does not cancel the server
+
+`settimeout` raises `TimeoutError`, which is an `OSError`. The server is
+still blocked in the connection you abandoned until you close your
+socket. The next client can then be served.
+
+```python file=n04.py
+import socket
+import struct
+import threading
+
+
+def frame(payload):
+    return struct.pack(">I", len(payload)) + payload
+
+
+def read_full(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            if not buf:
+                return None
+            raise EOFError(f"got {len(buf)} of {n}")
+        buf += chunk
+    return bytes(buf)
+
+
+def read_frame(sock):
+    header = read_full(sock, 4)
+    if header is None:
+        return None
+    (n,) = struct.unpack(">I", header)
+    return read_full(sock, n)
+
+
+def serve(port_out):
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen()
+    port_out.append(ls.getsockname()[1])
+    for mode in ("silent", "echo"):
         conn, _ = ls.accept()
         try:
-            if mode == "echo":
-                msg = read_frame(conn)
-                conn.sendall(frame(msg.upper()))
-            elif mode == "silent":
+            if mode == "silent":
                 conn.settimeout(2)
                 try:
                     conn.recv(1)
                 except OSError:
                     pass
             else:
+                conn.sendall(frame(read_frame(conn).upper()))
+        finally:
+            conn.close()
+    ls.close()
+
+
+port_out = []
+thread = threading.Thread(target=serve, args=(port_out,))
+thread.start()
+while not port_out:
+    pass
+port = port_out[0]
+sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+sock.settimeout(0.15)
+try:
+    print(read_frame(sock))
+except TimeoutError:
+    print("timeout", issubclass(TimeoutError, OSError))
+sock.close()
+sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+sock.sendall(frame(b"ping"))
+print("still", read_frame(sock).decode())
+sock.close()
+thread.join()
+```
+
+```text output
+timeout True
+still PING
+```
+
+## A short header is not a timeout and not a clean end
+
+The peer closed after two bytes of a four-byte header. `read_full` raises
+`EOFError`. A close before any byte of the next frame is the `None` that
+means "no more frames".
+
+```python file=n05.py
+import socket
+import struct
+import threading
+
+
+def read_full(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            if not buf:
+                return None
+            raise EOFError(f"got {len(buf)} of {n}")
+        buf += chunk
+    return bytes(buf)
+
+
+def read_frame(sock):
+    header = read_full(sock, 4)
+    if header is None:
+        return None
+    (n,) = struct.unpack(">I", header)
+    body = read_full(sock, n)
+    if body is None:
+        raise EOFError("truncated frame")
+    return body
+
+
+def serve(port_out):
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen()
+    port_out.append(ls.getsockname()[1])
+    for mode in ("drop", "close"):
+        conn, _ = ls.accept()
+        try:
+            if mode == "drop":
                 conn.sendall(b"\x00\x00")
         finally:
             conn.close()
@@ -75,32 +291,33 @@ thread.start()
 while not port_out:
     pass
 port = port_out[0]
-
-
-def connect():
-    return socket.create_connection(("127.0.0.1", port), timeout=2)
-
-
-sock = connect()
-sock.sendall(frame(b"ping"))
-print("frame", read_frame(sock).decode())
-sock.close()
-
-sock = connect()
-sock.settimeout(0.15)
+sock = socket.create_connection(("127.0.0.1", port), timeout=2)
 try:
     print(read_frame(sock))
-except TimeoutError:
-    print("timeout")
+except EOFError as e:
+    print("truncated", e)
 sock.close()
-
-sock = connect()
-try:
-    print(read_frame(sock))
-except EOFError:
-    print("truncated")
+sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+print("clean", read_frame(sock))
 sock.close()
 thread.join()
+```
+
+```text output
+truncated got 2 of 4
+clean None
+```
+
+## HTTP is a frame with text headers
+
+`ThreadingHTTPServer` and `urllib` write the bytes. The handler reads
+`Content-Length` bytes and answers with its own length. `log_message`
+prints to stderr by default; silence it when stdout is the result.
+
+```python file=n06.py
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -120,15 +337,34 @@ class Handler(BaseHTTPRequestHandler):
 httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 http_thread = threading.Thread(target=httpd.serve_forever)
 http_thread.start()
-http_port = httpd.server_address[1]
 req = urllib.request.Request(
-    f"http://127.0.0.1:{http_port}/echo", data=b"hi", method="POST"
+    f"http://127.0.0.1:{httpd.server_address[1]}/echo",
+    data=b"hi",
+    method="POST",
 )
 with urllib.request.urlopen(req, timeout=2) as resp:
     print("http", resp.status, resp.read().decode())
 httpd.shutdown()
 httpd.server_close()
 http_thread.join()
+```
+
+```text output
+http 200 echo:hi
+```
+
+## `readexactly` is `read_full` on an asyncio stream
+
+The server and the client use the same length prefix. `StreamReader` and
+`StreamWriter` are the socket, scheduled instead of blocked.
+
+```python file=n07.py
+import asyncio
+import struct
+
+
+def frame(payload):
+    return struct.pack(">I", len(payload)) + payload
 
 
 async def handle(reader, writer):
@@ -140,10 +376,10 @@ async def handle(reader, writer):
     await writer.wait_closed()
 
 
-async def amain():
+async def main():
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
-    aport = server.sockets[0].getsockname()[1]
-    reader, writer = await asyncio.open_connection("127.0.0.1", aport)
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(frame(b"async"))
     await writer.drain()
     n = int.from_bytes(await reader.readexactly(4), "big")
@@ -155,35 +391,12 @@ async def amain():
     await server.wait_closed()
 
 
-asyncio.run(amain())
+asyncio.run(main())
 ```
 
 ```text output
-frame PING
-timeout
-truncated
-http 200 echo:hi
 async ASYNC
 ```
-
-## Details that bite
-
-- A read of one byte is a successful read. Loop until the frame, or
-  the HTTP headers, are complete. `recv` returning `b""` means the peer
-  closed. That is a clean end only when you have not started a frame.
-- `settimeout` raises `TimeoutError` (an `OSError`). It does not cancel
-  the server. Close your socket, or the server stays blocked in the
-  connection you abandoned.
-- A peer that closes after two header bytes is `EOFError`, a different
-  failure from a timeout and from a clean end before the next frame.
-- `ThreadingHTTPServer` plus `urllib.request` writes the HTTP bytes for
-  you. The `asyncio` half is the same frame loop on `StreamReader` /
-  `StreamWriter`. `readexactly` is `read_full`.
-- `log_message` on `BaseHTTPRequestHandler` prints to stderr. Silence it
-  in programs whose stdout is the result.
-- Nothing here is TLS, HTTP/2, or a public address. Those sit on this
-  loop. `requests` is a third-party wrapper around it, and it blocks the
-  asyncio loop (lesson 12).
 
 ## Exercises
 

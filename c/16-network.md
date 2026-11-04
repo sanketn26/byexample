@@ -1,16 +1,26 @@
 # C 16 — Network programming
 
-A TCP socket is the stream from the previous lesson with a peer attached. `read` and `write` are the same calls. `poll` is how you wait with a deadline instead of blocking forever. HTTP/1.1 below is a length-prefixed body with ASCII headers in front, written by hand.
+A TCP socket is the stream from the previous lesson with a peer attached.
+`read` and `write` are the same calls, and one `read` can return a single
+byte of a frame. Loop until the length prefix and the body are both
+complete. `poll` waits with a deadline instead of blocking forever.
 
-## Example
+Bind `127.0.0.1` and port 0. The kernel picks a free port, and that port
+changes every run, so these programs print the payload, not the address.
+This is not TLS, HTTP/2, or `epoll`. Those sit above or below this.
 
-```c file=example.c
+## One frame in, one frame out
+
+The server uppercases the body and writes the same 4-byte length back.
+`EINTR` retries the call. The client does not print the port.
+
+```c file=n01.c
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -109,38 +119,26 @@ static void *serve(void *arg) {
     if (ls < 0 || write(a->ready, &go, 1) != 1) {
         return NULL;
     }
-    const char *mode[] = {"echo", "silent", "drop"};
-    for (int i = 0; i < 3; i++) {
-        int conn = accept(ls, NULL, NULL);
-        if (conn < 0) {
-            break;
-        }
-        if (strcmp(mode[i], "echo") == 0) {
-            unsigned char hdr[4];
-            if (read_full(conn, hdr, 4) == 1) {
-                uint32_t n = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
-                             ((uint32_t)hdr[2] << 8) | hdr[3];
-                unsigned char *body = malloc(n ? n : 1);
-                if (body && read_full(conn, body, n) == 1) {
-                    for (uint32_t j = 0; j < n; j++) {
-                        body[j] = (unsigned char)toupper(body[j]);
-                    }
-                    unsigned char *out = malloc(4 + n);
-                    if (out) {
-                        memcpy(out, hdr, 4);
-                        memcpy(out + 4, body, n);
-                        write_full(conn, out, 4 + n);
-                        free(out);
-                    }
+    int conn = accept(ls, NULL, NULL);
+    if (conn >= 0) {
+        unsigned char hdr[4];
+        if (read_full(conn, hdr, 4) == 1) {
+            uint32_t n = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                         ((uint32_t)hdr[2] << 8) | hdr[3];
+            unsigned char *body = malloc(n ? n : 1);
+            if (body && read_full(conn, body, n) == 1) {
+                for (uint32_t j = 0; j < n; j++) {
+                    body[j] = (unsigned char)toupper((unsigned char)body[j]);
                 }
-                free(body);
+                unsigned char *out = malloc(4 + n);
+                if (out) {
+                    memcpy(out, hdr, 4);
+                    memcpy(out + 4, body, n);
+                    write_full(conn, out, 4 + n);
+                    free(out);
+                }
             }
-        } else if (strcmp(mode[i], "silent") == 0) {
-            struct pollfd p = {.fd = conn, .events = POLLIN};
-            poll(&p, 1, 2000);
-        } else {
-            unsigned char partial[2] = {0, 0};
-            write_full(conn, partial, 2);
+            free(body);
         }
         close(conn);
     }
@@ -165,6 +163,412 @@ static int read_frame(int fd, unsigned char *dst, size_t cap, size_t *out) {
     }
     *out = n;
     return 1;
+}
+
+int main(void) {
+    int ready[2];
+    if (pipe(ready) != 0) {
+        return 1;
+    }
+    struct serve_arg arg = {.ready = ready[1], .port = 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, serve, &arg) != 0) {
+        return 1;
+    }
+    char go = 0;
+    if (read(ready[0], &go, 1) != 1) {
+        return 1;
+    }
+    close(ready[0]);
+    close(ready[1]);
+    int c = connect_loopback(arg.port);
+    if (c < 0) {
+        return 1;
+    }
+    unsigned char req[8] = {0, 0, 0, 4, 'p', 'i', 'n', 'g'};
+    write_full(c, req, sizeof req);
+    unsigned char body[16];
+    size_t n = 0;
+    int rc = read_frame(c, body, sizeof body, &n);
+    printf("frame %d %.*s\n", rc, (int)n, body);
+    close(c);
+    pthread_join(th, NULL);
+    return 0;
+}
+```
+
+```text output
+frame 1 PING
+```
+
+## poll returns when the deadline expires
+
+The server accepts and then waits on a socket nobody writes to. The
+client's `poll` uses 150 milliseconds and sees no data, so the result is
+a timeout, not a closed peer. A timeout does not cancel the server: this
+client closes its side, and the server is joined after its own wait.
+On some stacks a read timeout is reported like `EAGAIN` rather than a
+distinct "timed out" code. Treat both as the deadline firing.
+
+```c file=n02.c
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int listen_loopback(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t len = sizeof addr;
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static int connect_loopback(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+struct serve_arg {
+    int ready;
+    uint16_t port;
+};
+
+static void *serve(void *arg) {
+    struct serve_arg *a = arg;
+    int ls = listen_loopback(&a->port);
+    char go = 1;
+    if (ls < 0 || write(a->ready, &go, 1) != 1) {
+        if (ls >= 0) {
+            close(ls);
+        }
+        return NULL;
+    }
+    int conn = accept(ls, NULL, NULL);
+    if (conn >= 0) {
+        struct pollfd p = {.fd = conn, .events = POLLIN};
+        poll(&p, 1, 2000);
+        close(conn);
+    }
+    close(ls);
+    return NULL;
+}
+
+int main(void) {
+    int ready[2];
+    if (pipe(ready) != 0) {
+        return 1;
+    }
+    struct serve_arg arg = {.ready = ready[1], .port = 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, serve, &arg) != 0) {
+        return 1;
+    }
+    char go = 0;
+    if (read(ready[0], &go, 1) != 1) {
+        return 1;
+    }
+    close(ready[0]);
+    close(ready[1]);
+    int c = connect_loopback(arg.port);
+    if (c < 0) {
+        return 1;
+    }
+    struct pollfd p = {.fd = c, .events = POLLIN};
+    int pr = poll(&p, 1, 150);
+    printf("%s\n", pr == 0 ? "timeout" : "unexpected");
+    close(c);
+    pthread_join(th, NULL);
+    return 0;
+}
+```
+
+```text output
+timeout
+```
+
+## A short header is a truncated frame
+
+The server writes two bytes and closes. The client asked for a 4-byte
+length, got end-of-stream in the middle, and reports the frame as
+truncated. That is a different failure from the timeout above.
+
+```c file=n03.c
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int read_full(int fd, unsigned char *dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t k = read(fd, dst + got, n - got);
+        if (k == 0) {
+            return got == 0 ? 0 : -1;
+        }
+        if (k < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        got += (size_t)k;
+    }
+    return 1;
+}
+
+static int write_full(int fd, const unsigned char *src, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t k = write(fd, src + off, n - off);
+        if (k < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (k == 0) {
+            return -1;
+        }
+        off += (size_t)k;
+    }
+    return 0;
+}
+
+static int listen_loopback(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t len = sizeof addr;
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static int connect_loopback(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+struct serve_arg {
+    int ready;
+    uint16_t port;
+};
+
+static void *serve(void *arg) {
+    struct serve_arg *a = arg;
+    int ls = listen_loopback(&a->port);
+    char go = 1;
+    if (ls < 0 || write(a->ready, &go, 1) != 1) {
+        if (ls >= 0) {
+            close(ls);
+        }
+        return NULL;
+    }
+    int conn = accept(ls, NULL, NULL);
+    if (conn >= 0) {
+        unsigned char partial[2] = {0, 0};
+        write_full(conn, partial, 2);
+        close(conn);
+    }
+    close(ls);
+    return NULL;
+}
+
+static int read_frame(int fd, unsigned char *dst, size_t cap, size_t *out) {
+    unsigned char hdr[4];
+    int rc = read_full(fd, hdr, 4);
+    if (rc <= 0) {
+        return rc;
+    }
+    uint32_t n = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                 ((uint32_t)hdr[2] << 8) | hdr[3];
+    if ((size_t)n > cap) {
+        return -1;
+    }
+    rc = read_full(fd, dst, n);
+    if (rc <= 0) {
+        return -1;
+    }
+    *out = n;
+    return 1;
+}
+
+int main(void) {
+    int ready[2];
+    if (pipe(ready) != 0) {
+        return 1;
+    }
+    struct serve_arg arg = {.ready = ready[1], .port = 0};
+    pthread_t th;
+    if (pthread_create(&th, NULL, serve, &arg) != 0) {
+        return 1;
+    }
+    char go = 0;
+    if (read(ready[0], &go, 1) != 1) {
+        return 1;
+    }
+    close(ready[0]);
+    close(ready[1]);
+    int c = connect_loopback(arg.port);
+    if (c < 0) {
+        return 1;
+    }
+    unsigned char body[16];
+    size_t n = 0;
+    int rc = read_frame(c, body, sizeof body, &n);
+    printf("%s\n", rc < 0 ? "truncated" : "unexpected");
+    close(c);
+    pthread_join(th, NULL);
+    return 0;
+}
+```
+
+```text output
+truncated
+```
+
+## HTTP/1.1 is headers plus a length
+
+Read until the blank line (`\r\n\r\n`). `Content-Length` says where the
+body ends; `Connection: close` is the other signal. The response body
+here is the seven bytes after the header block. A library's HTTP client
+puts the same bytes on the socket.
+
+```c file=n04.c
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int write_full(int fd, const unsigned char *src, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t k = write(fd, src + off, n - off);
+        if (k <= 0) {
+            return -1;
+        }
+        off += (size_t)k;
+    }
+    return 0;
+}
+
+static int listen_loopback(uint16_t *port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t len = sizeof addr;
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static int connect_loopback(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 static void *http_one(void *arg) {
@@ -193,43 +597,6 @@ static void *http_one(void *arg) {
 }
 
 int main(void) {
-    int ready[2];
-    if (pipe(ready) != 0) {
-        return 1;
-    }
-    struct serve_arg arg = {.ready = ready[1], .port = 0};
-    pthread_t th;
-    if (pthread_create(&th, NULL, serve, &arg) != 0) {
-        return 1;
-    }
-    char go = 0;
-    if (read(ready[0], &go, 1) != 1) {
-        return 1;
-    }
-    close(ready[0]);
-    close(ready[1]);
-
-    int c = connect_loopback(arg.port);
-    unsigned char req[8] = {0, 0, 0, 4, 'p', 'i', 'n', 'g'};
-    write_full(c, req, sizeof req);
-    unsigned char body[16];
-    size_t n = 0;
-    int rc = read_frame(c, body, sizeof body, &n);
-    printf("frame %d %.*s\n", rc, (int)n, body);
-    close(c);
-
-    c = connect_loopback(arg.port);
-    struct pollfd p = {.fd = c, .events = POLLIN};
-    int pr = poll(&p, 1, 150);
-    printf("%s\n", pr == 0 ? "timeout" : "unexpected");
-    close(c);
-
-    c = connect_loopback(arg.port);
-    rc = read_frame(c, body, sizeof body, &n);
-    printf("%s\n", rc < 0 ? "truncated" : "unexpected");
-    close(c);
-    pthread_join(th, NULL);
-
     uint16_t hp = 0;
     int hs = listen_loopback(&hp);
     if (hs < 0) {
@@ -239,7 +606,10 @@ int main(void) {
     if (pthread_create(&http, NULL, http_one, &hs) != 0) {
         return 1;
     }
-    c = connect_loopback(hp);
+    int c = connect_loopback(hp);
+    if (c < 0) {
+        return 1;
+    }
     const char *hreq =
         "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n"
         "Connection: close\r\n\r\nhi";
@@ -264,31 +634,9 @@ int main(void) {
 ```
 
 ```text output
-frame 1 PING
-timeout
-truncated
 http echo:hi
 ```
 
-## Details that bite
-
-- TCP is a stream of bytes, not a stream of messages. One `read` can
-  return a single byte of a frame. Loop until the length prefix and the
-  body are both complete.
-- Bind `127.0.0.1` and port 0. The kernel picks a free port. The port
-  changes every run, so the example prints the payload, not the address.
-- A timeout and a peer who closes mid-frame are different errors. The
-  timeout does not cancel the server: close your side, or the accept
-  loop stays stuck in the connection you abandoned.
-- On Rust, `set_read_timeout` usually surfaces as `ErrorKind::WouldBlock`,
-  not `TimedOut`. Treat both as a timeout.
-- HTTP/1.1 is the same loop plus ASCII headers. `Content-Length` tells
-  you when the body ends; `Connection: close` is the other signal. Go's
-  `net/http` and a hand-written request in C or Rust put the same bytes
-  on the socket.
-- This is not TLS, HTTP/2, or `epoll`. Those are the next layer down or
-  up. Tokio is the async version of this lesson and needs Cargo; the file
-  here stays on `std::net` and threads so `rustc` still builds it.
 
 ## Exercises
 
@@ -296,6 +644,7 @@ The harness is a small server. `exchange` sends one frame and reads one. `classi
 
 ```c file=exercise.c
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -565,6 +914,7 @@ int main(void) {
 
 ```c file=solution.c
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>

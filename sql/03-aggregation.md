@@ -1,79 +1,136 @@
 # SQL 03 — Aggregation and GROUP BY
 
-An **aggregate** collapses many rows into one value: `count`, `sum`, `avg`,
-`min`, `max`, `group_concat`. `GROUP BY` does it once per group instead of
-once for the whole table. `HAVING` filters the *groups*; `WHERE` filters the
-*rows* before grouping.
+An aggregate collapses many rows into one value: `count`, `sum`, `avg`,
+`min`, `max`, `string_agg`. `GROUP BY` does that once per group. `HAVING`
+filters groups. `WHERE` filters rows before they are grouped.
 
-## Example
+## Aggregates collapse the whole table
 
-```sql file=example.sql
+`count(*)` counts rows. `count(qty)` skips NULL. `sum` of `integer` is
+`bigint`. `avg` of `integer` is `numeric`, so a whole-number average prints
+at full scale.
+
+```sql file=n01.sql
 CREATE TABLE sale (
-  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, unit_price REAL, sold_on TEXT
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
 );
-INSERT INTO sale (region, product, qty, unit_price, sold_on) VALUES
-  ('north', 'widget', 10, 2.50, '2024-01-05'),
-  ('north', 'gadget',  3, 9.00, '2024-01-17'),
-  ('south', 'widget',  7, 2.50, '2024-02-02'),
-  ('south', 'widget',  5, 2.60, '2024-02-20'),
-  ('south', 'gizmo',   1, 40.0, '2024-03-01'),
-  ('east',  'gadget',  4, 9.00, '2024-03-09'),
-  ('east',  'gadget', NULL, 9.00, '2024-03-10');
-
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
 .headers on
--- Whole-table aggregates: one row out
 SELECT count(*) AS rows, count(qty) AS with_qty, sum(qty) AS units,
        min(sold_on) AS first, max(sold_on) AS last
 FROM sale;
-
--- avg ignores NULLs; sum of nothing is NULL, count of nothing is 0
-SELECT avg(qty) AS avg_qty, sum(qty) FILTER (WHERE region = 'nowhere') AS none,
-       count(*) FILTER (WHERE region = 'nowhere') AS zero
+SELECT pg_typeof(sum(qty)) AS sum_type, pg_typeof(avg(qty)) AS avg_type, avg(qty)
 FROM sale;
-
--- GROUP BY: one row per group
-SELECT region, count(*) AS n, sum(qty * unit_price) AS revenue
-FROM sale GROUP BY region ORDER BY region;
-
--- Group by several columns, or by an expression
-SELECT region, product, sum(qty) AS units
-FROM sale GROUP BY region, product ORDER BY region, product;
-SELECT substr(sold_on, 1, 7) AS month, count(*) AS n
-FROM sale GROUP BY month ORDER BY month;
-
--- HAVING filters groups; WHERE filters rows first
-SELECT product, sum(qty) AS units
-FROM sale WHERE unit_price < 20
-GROUP BY product HAVING sum(qty) >= 10 ORDER BY product;
-
--- group_concat builds a list per group
-SELECT region, group_concat(DISTINCT product) AS products
-FROM sale GROUP BY region ORDER BY region;
-
--- Conditional aggregation: pivot with CASE or FILTER
-SELECT product,
-       sum(CASE WHEN region = 'north' THEN qty ELSE 0 END) AS north,
-       sum(qty) FILTER (WHERE region = 'south') AS south
-FROM sale GROUP BY product ORDER BY product;
-
--- count(DISTINCT x)
-SELECT count(DISTINCT product) AS products, count(DISTINCT region) AS regions FROM sale;
-
--- Percent of total: a scalar subquery inside the select list
-SELECT region, round(100.0 * sum(qty * unit_price) /
-       (SELECT sum(qty * unit_price) FROM sale), 1) AS pct
-FROM sale GROUP BY region ORDER BY pct DESC;
 ```
 
 ```text output
 rows|with_qty|units|first|last
 7|6|30|2024-01-05|2024-03-10
-avg_qty|none|zero
-5.0||0
+sum_type|avg_type|avg
+bigint|numeric|5.0000000000000000
+```
+
+## sum and avg skip NULL
+
+`avg` of `(10, NULL)` is 10, not 5. Use `avg(coalesce(x, 0))` when missing
+means zero. `sum` over no rows is NULL, not 0. `count(*)` over no rows is 0.
+Wrap an empty sum in `coalesce(sum(x), 0)`. Cast the average to `float8`
+when you want a short float: a whole number then prints as `5`, not `5.0`.
+
+```sql file=n02.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT avg(qty) AS avg_qty, avg(qty)::float8 AS avg_float,
+       sum(qty) FILTER (WHERE region = 'nowhere') AS none,
+       count(*) FILTER (WHERE region = 'nowhere') AS zero
+FROM sale;
+```
+
+```text output
+avg_qty|avg_float|none|zero
+5.0000000000000000|5||0
+```
+
+## GROUP BY makes one row per group
+
+Every selected column must be in the `GROUP BY` or inside an aggregate.
+Leaving one out is an error. Joining a one-to-many table before you
+aggregate multiplies the numbers (lesson 04). Aggregate first, then join.
+`unit_price` is `numeric`, so revenue keeps two decimal places.
+
+```sql file=n03.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+-- expect-error
+SELECT region, product, sum(qty) FROM sale GROUP BY region;
+.headers on
+SELECT region, count(*) AS n, sum(qty * unit_price) AS revenue
+FROM sale GROUP BY region ORDER BY region;
+```
+
+```text output
+Error: column "sale.product" must appear in the GROUP BY clause or be used in an aggregate function
 region|n|revenue
-east|2|36.0
-north|2|52.0
-south|3|70.5
+east|2|36.00
+north|2|52.00
+south|3|70.50
+```
+
+## Group by several columns, or by an expression
+
+Each distinct combination is a group. `substr(sold_on, 1, 7)` groups by
+month without a date type. `GROUP BY` may use that select alias.
+
+```sql file=n04.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT region, product, sum(qty) AS units
+FROM sale GROUP BY region, product ORDER BY region, product;
+SELECT substr(sold_on, 1, 7) AS month, count(*) AS n
+FROM sale GROUP BY month ORDER BY month;
+```
+
+```text output
 region|product|units
 east|gadget|4
 north|gadget|3
@@ -84,84 +141,204 @@ month|n
 2024-01|2
 2024-02|2
 2024-03|3
+```
+
+## HAVING filters groups, not rows
+
+`WHERE` runs before grouping, so it cannot see `sum`. That condition is
+an error in `WHERE` and legal in `HAVING`. Prefer `WHERE` when the test
+does not need an aggregate: it throws rows away before they are grouped.
+
+```sql file=n05.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+-- expect-error
+SELECT product, sum(qty) FROM sale WHERE sum(qty) > 5 GROUP BY product;
+.headers on
+SELECT product, sum(qty) AS units
+FROM sale WHERE unit_price < 20
+GROUP BY product HAVING sum(qty) >= 10 ORDER BY product;
+```
+
+```text output
+Error: aggregate functions are not allowed in WHERE
 product|units
 widget|22
+```
+
+## string_agg builds a list per group
+
+The separator is required. `DISTINCT` keeps each product once. `string_agg`
+skips NULL. The list order is unspecified unless you write `ORDER BY`
+inside the aggregate.
+
+```sql file=n06.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT region, string_agg(DISTINCT product, ',' ORDER BY product) AS products
+FROM sale GROUP BY region ORDER BY region;
+```
+
+```text output
 region|products
 east|gadget
-north|widget,gadget
-south|widget,gizmo
+north|gadget,widget
+south|gizmo,widget
+```
+
+## CASE or FILTER pivots a group
+
+`FILTER (WHERE ...)` limits which rows an aggregate sees. `ELSE 0` turns a
+missing region into zero; `FILTER` leaves it NULL.
+
+```sql file=n07.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT product,
+       sum(CASE WHEN region = 'north' THEN qty ELSE 0 END) AS north,
+       sum(qty) FILTER (WHERE region = 'south') AS south
+FROM sale GROUP BY product ORDER BY product;
+```
+
+```text output
 product|north|south
 gadget|3|
 gizmo|0|1
 widget|10|12
+```
+
+## count(DISTINCT col) counts values, not rows
+
+Three different questions: how many rows, how many non-NULL values, how
+many different values. The east region has two gadget rows and one product.
+
+```sql file=n08.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT count(DISTINCT product) AS products, count(DISTINCT region) AS regions FROM sale;
+```
+
+```text output
 products|regions
 3|3
+```
+
+## A scalar subquery can be the denominator
+
+The inner `sum` runs once and is one number. Divide by it to get a share
+of the total. `100.0` makes the division `numeric`. `round(..., 1)` keeps
+one decimal place.
+
+```sql file=n09.sql
+CREATE TABLE sale (
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
+);
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
+.headers on
+SELECT region, round(100.0 * sum(qty * unit_price) /
+       (SELECT sum(qty * unit_price) FROM sale), 1) AS pct
+FROM sale GROUP BY region ORDER BY pct DESC;
+```
+
+```text output
 region|pct
 south|44.5
 north|32.8
 east|22.7
 ```
 
-## Details that bite
-
-- Every selected column must be either in `GROUP BY` or inside an
-  aggregate. PostgreSQL enforces this. SQLite and old MySQL quietly pick
-  an arbitrary row's value, which is a bug waiting for a data change.
-- `count(*)` vs `count(col)` vs `count(DISTINCT col)` are three different
-  numbers once NULLs and duplicates exist.
-- `sum`/`avg` skip NULLs; `avg` of `(10, NULL)` is 10, not 5. Use
-  `avg(coalesce(x, 0))` when "missing" really means zero.
-- `sum` over zero rows is **NULL**, not 0: wrap in `coalesce(sum(x), 0)`.
-- `WHERE sum(x) > 5` is an error: aggregates are not available before
-  grouping. That is what `HAVING` is for.
-- Filtering in `WHERE` is cheaper than `HAVING` when the condition does
-  not depend on an aggregate: it removes rows before they are grouped.
-- Integer math: `avg` returns a real in SQLite; `sum` of integers stays an
-  integer. In PostgreSQL `avg(int)` is `numeric`, `sum(int)` is `bigint`.
-- Join first, then aggregate: aggregating after a one-to-many join
-  multiplies the numbers (lesson 04).
-- `FILTER (WHERE ...)` is standard SQL and PostgreSQL/SQLite support it;
-  MySQL needs the `CASE` form.
-
 ## Exercises
 
 ```sql file=exercise.sql
 CREATE TABLE sale (
-  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, unit_price REAL, sold_on TEXT
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
 );
-INSERT INTO sale (region, product, qty, unit_price, sold_on) VALUES
-  ('north', 'widget', 10, 2.50, '2024-01-05'),
-  ('north', 'gadget',  3, 9.00, '2024-01-17'),
-  ('south', 'widget',  7, 2.50, '2024-02-02'),
-  ('south', 'widget',  5, 2.60, '2024-02-20'),
-  ('south', 'gizmo',   1, 40.0, '2024-03-01'),
-  ('east',  'gadget',  4, 9.00, '2024-03-09'),
-  ('east',  'gadget', NULL, 9.00, '2024-03-10');
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
 
 -- q1: total revenue (qty * unit_price) per region, only regions with revenue
 --     over 50, ordered by revenue descending. Columns: region, revenue.
-CREATE VIEW q1 AS SELECT NULL AS region, NULL AS revenue WHERE 0;       -- TODO
+CREATE VIEW q1 AS SELECT NULL::TEXT AS region, NULL::NUMERIC AS revenue WHERE false;  -- TODO
 
 -- q2: the number of sales rows that have NO quantity. Column: n.
-CREATE VIEW q2 AS SELECT NULL AS n;                                     -- TODO
+CREATE VIEW q2 AS SELECT NULL::BIGINT AS n;                          -- TODO
 
 -- q3: per product, the average unit_price rounded to 2 decimals, for
 --     products sold more than once. Columns: product, avg_price (by product).
-CREATE VIEW q3 AS SELECT NULL AS product, NULL AS avg_price WHERE 0;    -- TODO
+CREATE VIEW q3 AS SELECT NULL::TEXT AS product, NULL::NUMERIC AS avg_price WHERE false;  -- TODO
 
 -- q4: per month ('2024-01' style), total units, treating missing qty as 0.
 --     Columns: month, units, ordered by month.
-CREATE VIEW q4 AS SELECT NULL AS month, NULL AS units WHERE 0;          -- TODO
+CREATE VIEW q4 AS SELECT NULL::TEXT AS month, NULL::BIGINT AS units WHERE false;  -- TODO
 
--- q5: the region with the highest total units. One row, column: region.
-CREATE VIEW q5 AS SELECT NULL AS region WHERE 0;                        -- TODO
+-- q5: the region with the highest total units. North and south tie;
+--     pick the name that sorts last. One row, column: region.
+CREATE VIEW q5 AS SELECT NULL::TEXT AS region WHERE false;           -- TODO
 
-CREATE TEMP TABLE t (name TEXT, ok INTEGER CHECK (ok = 1));
-INSERT INTO t VALUES ('q1', (SELECT group_concat(region || '=' || revenue, ',') FROM q1) IS 'south=70.5,north=52.0');
-INSERT INTO t VALUES ('q2', (SELECT n FROM q2) IS 1);
-INSERT INTO t VALUES ('q3', (SELECT group_concat(product || '=' || avg_price, ',') FROM (SELECT * FROM q3 ORDER BY product)) IS 'gadget=9.0,widget=2.53');
-INSERT INTO t VALUES ('q4', (SELECT group_concat(month || '=' || units, ',') FROM q4) IS '2024-01=13,2024-02=12,2024-03=5');
-INSERT INTO t VALUES ('q5', (SELECT region FROM q5) IS 'south');
+CREATE TABLE t (name TEXT, ok BOOLEAN CHECK (ok));
+INSERT INTO t VALUES ('q1', (SELECT string_agg(region || '=' || revenue, ',' ORDER BY revenue DESC) FROM q1) IS NOT DISTINCT FROM 'south=70.50,north=52.00');
+INSERT INTO t VALUES ('q2', (SELECT n FROM q2) IS NOT DISTINCT FROM 1);
+INSERT INTO t VALUES ('q3', (SELECT string_agg(product || '=' || avg_price, ',' ORDER BY product) FROM q3) IS NOT DISTINCT FROM 'gadget=9.00,widget=2.53');
+INSERT INTO t VALUES ('q4', (SELECT string_agg(month || '=' || units, ',' ORDER BY month) FROM q4) IS NOT DISTINCT FROM '2024-01=13,2024-02=12,2024-03=5');
+INSERT INTO t VALUES ('q5', (SELECT region FROM q5) IS NOT DISTINCT FROM 'south');
 SELECT 'PASS ' || name FROM t;
 ```
 
@@ -169,16 +346,17 @@ SELECT 'PASS ' || name FROM t;
 
 ```sql file=solution.sql
 CREATE TABLE sale (
-  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, unit_price REAL, sold_on TEXT
+  id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER,
+  unit_price NUMERIC, sold_on TEXT
 );
-INSERT INTO sale (region, product, qty, unit_price, sold_on) VALUES
-  ('north', 'widget', 10, 2.50, '2024-01-05'),
-  ('north', 'gadget',  3, 9.00, '2024-01-17'),
-  ('south', 'widget',  7, 2.50, '2024-02-02'),
-  ('south', 'widget',  5, 2.60, '2024-02-20'),
-  ('south', 'gizmo',   1, 40.0, '2024-03-01'),
-  ('east',  'gadget',  4, 9.00, '2024-03-09'),
-  ('east',  'gadget', NULL, 9.00, '2024-03-10');
+INSERT INTO sale (id, region, product, qty, unit_price, sold_on) VALUES
+  (1, 'north', 'widget', 10, 2.50, '2024-01-05'),
+  (2, 'north', 'gadget',  3, 9.00, '2024-01-17'),
+  (3, 'south', 'widget',  7, 2.50, '2024-02-02'),
+  (4, 'south', 'widget',  5, 2.60, '2024-02-20'),
+  (5, 'south', 'gizmo',   1, 40.00, '2024-03-01'),
+  (6, 'east',  'gadget',  4, 9.00, '2024-03-09'),
+  (7, 'east',  'gadget', NULL, 9.00, '2024-03-10');
 
 CREATE VIEW q1 AS
   SELECT region, sum(qty * unit_price) AS revenue FROM sale
@@ -191,14 +369,15 @@ CREATE VIEW q4 AS
   SELECT substr(sold_on, 1, 7) AS month, sum(coalesce(qty, 0)) AS units FROM sale
   GROUP BY month ORDER BY month;
 CREATE VIEW q5 AS
-  SELECT region FROM sale GROUP BY region ORDER BY sum(qty) DESC LIMIT 1;
+  SELECT region FROM sale GROUP BY region
+  ORDER BY sum(qty) DESC, region DESC LIMIT 1;
 
-CREATE TEMP TABLE t (name TEXT, ok INTEGER CHECK (ok = 1));
-INSERT INTO t VALUES ('q1', (SELECT group_concat(region || '=' || revenue, ',') FROM q1) IS 'south=70.5,north=52.0');
-INSERT INTO t VALUES ('q2', (SELECT n FROM q2) IS 1);
-INSERT INTO t VALUES ('q3', (SELECT group_concat(product || '=' || avg_price, ',') FROM (SELECT * FROM q3 ORDER BY product)) IS 'gadget=9.0,widget=2.53');
-INSERT INTO t VALUES ('q4', (SELECT group_concat(month || '=' || units, ',') FROM q4) IS '2024-01=13,2024-02=12,2024-03=5');
-INSERT INTO t VALUES ('q5', (SELECT region FROM q5) IS 'south');
+CREATE TABLE t (name TEXT, ok BOOLEAN CHECK (ok));
+INSERT INTO t VALUES ('q1', (SELECT string_agg(region || '=' || revenue, ',' ORDER BY revenue DESC) FROM q1) IS NOT DISTINCT FROM 'south=70.50,north=52.00');
+INSERT INTO t VALUES ('q2', (SELECT n FROM q2) IS NOT DISTINCT FROM 1);
+INSERT INTO t VALUES ('q3', (SELECT string_agg(product || '=' || avg_price, ',' ORDER BY product) FROM q3) IS NOT DISTINCT FROM 'gadget=9.00,widget=2.53');
+INSERT INTO t VALUES ('q4', (SELECT string_agg(month || '=' || units, ',' ORDER BY month) FROM q4) IS NOT DISTINCT FROM '2024-01=13,2024-02=12,2024-03=5');
+INSERT INTO t VALUES ('q5', (SELECT region FROM q5) IS NOT DISTINCT FROM 'south');
 SELECT 'PASS ' || name FROM t;
 ```
 

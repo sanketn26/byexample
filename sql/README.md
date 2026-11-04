@@ -1,17 +1,18 @@
 # SQL by Example (practice edition)
 
-Runs on **SQLite 3.35+** (window functions, `RETURNING`, JSON). It needs no
-server. Each lesson is one `.sql` script. Run it with the course runner (it
-behaves like `sqlite3 -bail :memory:` and needs only Python 3.12):
+Runs on **PostgreSQL 16** in the Docker container `byexample-pg`. Each
+lesson is a series of tiny scripts, one concept each. The course runner
+creates a throwaway database, prints rows as `a|b|c`, and prints booleans
+as `t` and `f`:
 
 ```sh
-python3 tools/sqlrun.py example.sql
+python3 tools/sqlrun.py n01.sql
 ```
 
-or paste it into any `sqlite3` shell. Exercises are views you fill in; the
-checks at the bottom stop at the first wrong answer and name it. The comment
-`-- expect-error` marks a statement that must fail (plain comment elsewhere).
-Lesson 15 shows where PostgreSQL and MySQL differ.
+Exercises are views you fill in. The comment `-- expect-error` marks a
+statement that must fail. Lesson 15 is the PostgreSQL queries people look
+up: `DISTINCT ON`, `ON CONFLICT`, `jsonb`, `generate_series`, `FILTER`,
+and `LATERAL`.
 
 | # | Lesson | You will practise |
 |---|--------|-------------------|
@@ -29,4 +30,4 @@ Lesson 15 shows where PostgreSQL and MySQL differ.
 | 12 | [JSON, dates and text](12-json-dates-text.md) | `->>`, `json_each`, `strftime`, `printf` |
 | 13 | [Recursive queries](13-recursive-ctes.md) | trees, graphs, sequences, cycle safety |
 | 14 | [Capstone: bookstore](14-capstone-bookstore.md) | schema + migrations + analytics end to end |
-| 15 | [Dialects](15-dialects.md) | SQLite vs PostgreSQL vs MySQL, the portable core |
+| 15 | [PostgreSQL patterns](15-postgres.md) | `DISTINCT ON`, upsert, `jsonb`, `LATERAL`, `FILTER` |

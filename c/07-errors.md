@@ -1,17 +1,22 @@
 # C 07 — Error Handling
 
-C has no exceptions. Errors are *values*: return codes, `errno`, `NULL`
-pointers, or out-parameters. Discipline is the only thing that keeps them
-from being ignored.
+C has no exceptions. Errors are values: a status code, `errno`, a `NULL`
+pointer, or an out-parameter. Check every return that can fail — `malloc`,
+`fopen`, `fread`, `fclose`, `snprintf`, `scanf`. A silent failure becomes
+corruption later.
 
-## Example
+Pick one convention and keep it. Returning 0 for success and a negative
+value or an enum for failure is the usual one. Mixing "1 means success"
+with "0 means success" is a bug factory.
 
-```c file=example.c
-#include <assert.h>
-#include <errno.h>
+## A status code names the failure
+
+The value comes out through a pointer. A bad argument returns a name, and
+does not write the result. `safe_div` refuses a null out-pointer and a
+zero divisor.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 enum status { OK = 0, ERR_NULL, ERR_RANGE, ERR_NOMEM };
 
@@ -29,7 +34,6 @@ static const char *status_str(enum status s) {
     return "unknown";
 }
 
-/* Convention: return a status, deliver the value through an out-parameter */
 static enum status safe_div(int a, int b, int *out) {
     if (!out) {
         return ERR_NULL;
@@ -41,23 +45,61 @@ static enum status safe_div(int a, int b, int *out) {
     return OK;
 }
 
-/* Alternative: a result type carrying either a value or an error */
-struct result {
-    int ok;
-    union {
-        int value;
-        const char *error;
-    };
-};
-
-static struct result parse_digit(char c) {
-    if (c < '0' || c > '9') {
-        return (struct result){.ok = 0, .error = "not a digit"};
-    }
-    return (struct result){.ok = 1, .value = c - '0'};
+int main(void) {
+    int r = 0;
+    enum status st = safe_div(7, 2, &r);
+    printf("%s %d\n", status_str(st), r);
+    printf("%s\n", status_str(safe_div(1, 0, &r)));
+    printf("%s\n", status_str(safe_div(1, 1, NULL)));
+    return 0;
 }
+```
 
-/* goto cleanup: single exit, resources released in reverse order */
+```text output
+ok 3
+range error
+null pointer
+```
+
+## errno is meaningful only just after the failure
+
+`fopen` returns `NULL` and sets `errno`. A later successful call may
+overwrite it, so read it immediately. Set `errno = 0` before functions
+like `strtol` that use `errno` as their only signal. `perror` and
+`strerror` turn the number into text. `strerror` may not be thread-safe;
+use `strerror_r` when other threads are running.
+
+```c file=n02.c
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    errno = 0;
+    FILE *f = fopen("/definitely/not/here", "r");
+    if (!f) {
+        printf("%d %s\n", errno == ENOENT, strerror(errno));
+    }
+    return 0;
+}
+```
+
+```text output
+1 No such file or directory
+```
+
+## goto cleanup has one exit
+
+Acquire in order, release in reverse, and jump to the same label from
+every failure. `free(NULL)` does nothing, so the cleanup can be
+unconditional. This is the usual shape in the Linux kernel. `setjmp` /
+`longjmp` can leave a function early too, but they skip this cleanup and
+are rarely the right tool.
+
+```c file=n03.c
+#include <stdio.h>
+#include <stdlib.h>
+
 static int build(int fail_at) {
     int rc = -1;
     char *a = NULL, *b = NULL;
@@ -78,10 +120,89 @@ static int build(int fail_at) {
     }
     rc = 0;
 out:
-    free(b); /* free(NULL) is a no-op, so unconditional cleanup is fine */
+    free(b);
     free(a);
     return rc;
 }
+
+int main(void) {
+    printf("%d %d %d\n", build(0), build(1), build(2));
+    return 0;
+}
+```
+
+```text output
+0 -1 -1
+```
+
+## A result can carry a value or an error
+
+The `ok` flag says which union member is live. On failure the string is
+the error; on success `value` is the digit.
+
+```c file=n04.c
+#include <stdio.h>
+
+struct result {
+    int ok;
+    union {
+        int value;
+        const char *error;
+    };
+};
+
+static struct result parse_digit(char c) {
+    if (c < '0' || c > '9') {
+        return (struct result){.ok = 0, .error = "not a digit"};
+    }
+    return (struct result){.ok = 1, .value = c - '0'};
+}
+
+int main(void) {
+    struct result d = parse_digit('7');
+    printf("%s %d\n", d.ok ? "ok" : "error", d.value);
+    struct result bad = parse_digit('x');
+    printf("error: %s\n", bad.error);
+    return 0;
+}
+```
+
+```text output
+ok 7
+error: not a digit
+```
+
+## assert documents an impossible state
+
+`assert` aborts when the expression is false. It is not for validating
+input: compiling with `-DNDEBUG` removes it, including any side effects
+inside the expression.
+
+```c file=n05.c
+#include <assert.h>
+#include <stdio.h>
+
+int main(void) {
+    int r = 3;
+    assert(r == 3);
+    puts("kept");
+    return 0;
+}
+```
+
+```text output
+kept
+```
+
+## exit runs atexit handlers; abort does not
+
+`exit` flushes stdio and runs the handlers registered with `atexit`, in
+reverse order of registration. `_Exit` and `abort` do neither. The line
+below is printed on the way out, after `main` returns.
+
+```c file=n06.c
+#include <stdio.h>
+#include <stdlib.h>
 
 static void goodbye(void) {
     puts("bye");
@@ -89,65 +210,14 @@ static void goodbye(void) {
 
 int main(void) {
     atexit(goodbye);
-
-    int r = 0;
-    enum status st = safe_div(7, 2, &r);
-    printf("%s %d\n", status_str(st), r);
-    printf("%s\n", status_str(safe_div(1, 0, &r)));
-    printf("%s\n", status_str(safe_div(1, 1, NULL)));
-
-    /* errno: set by the failing library call; only read it right after */
-    errno = 0;
-    FILE *f = fopen("/definitely/not/here", "r");
-    if (!f) {
-        printf("%d %s\n", errno == ENOENT, strerror(errno));
-    }
-
-    printf("%d %d %d\n", build(0), build(1), build(2));
-
-    struct result d = parse_digit('7');
-    printf("%s %d\n", d.ok ? "ok" : "error", d.value);
-    struct result bad = parse_digit('x');
-    printf("error: %s\n", bad.error);
-
-    /* assert documents impossible states; compiled out with -DNDEBUG */
-    assert(r == 3);
     return EXIT_SUCCESS;
 }
 ```
 
 ```text output
-ok 3
-range error
-null pointer
-1 No such file or directory
-0 -1 -1
-ok 7
-error: not a digit
 bye
 ```
 
-## Details that bite
-
-- **Check every return value** that can fail: `malloc`, `fopen`, `fread`,
-  `fclose`, `snprintf`, `scanf`. Silent failure becomes corruption later.
-- `errno` is only meaningful immediately after a call that reported failure
-  (usually by returning `-1`/`NULL`). Successful calls may change it.
-  Set `errno = 0` before calls like `strtol` that signal errors only via
-  `errno`.
-- `perror("fopen")` and `strerror(errno)` turn the number into text.
-  `strerror` may not be thread-safe; use `strerror_r` in threaded code.
-- Never use `assert` for runtime input validation: with `NDEBUG` it
-  vanishes, along with any side effects inside it.
-- `exit()` runs `atexit` handlers and flushes stdio; `_Exit()` and
-  `abort()` do not.
-- Return `0` for success and negative or an enum for failure, consistently
-  across your API. Mixing "1 means success" with "0 means success" is a
-  bug factory.
-- `goto cleanup` is the standard, readable way to avoid duplicated cleanup
-  code, and is how the Linux kernel does it.
-- There is `setjmp`/`longjmp` for non-local exits, but it skips cleanup and
-  is rarely the right tool.
 
 ## Exercises
 

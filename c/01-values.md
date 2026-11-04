@@ -1,86 +1,297 @@
 # C 01 — Values, Types and printf
 
 C gives you small, fixed-size machine types and almost no safety net. You
-must know exactly what each operation does to the bits.
+must know exactly what each operation does to the bits. Sizes below are for
+LP64 (64-bit Linux and macOS).
 
-All examples build with
-`gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined`
-(this is what `tools/verify.py` uses). Sizes shown are for 64-bit
-Linux/macOS (LP64).
+A local with no initializer is indeterminate; reading it is undefined, so
+initialize at the declaration. `=` assigns and `==` compares: `if (x = 5)`
+is an assignment, and `-Wall` warns about it.
 
-## Example
+## Sizes come from sizeof
 
-```c file=example.c
-#include <limits.h>
-#include <stdbool.h>
-#include <stdint.h>
+`sizeof` is the portable width. `char` is 1 by definition; the other widths
+are not. A pointer here is 8 bytes.
+
+```c file=n01.c
 #include <stdio.h>
-#include <string.h>
-
-enum Color { RED, GREEN = 5, BLUE }; /* BLUE is 6 */
-
-#define SQUARE(x) ((x) * (x))
 
 int main(void) {
-    /* Sizes are platform dependent: always use sizeof */
     printf("%zu %zu %zu %zu %zu\n", sizeof(char), sizeof(short), sizeof(int),
            sizeof(long), sizeof(long long));
     printf("%zu %zu %zu\n", sizeof(float), sizeof(double), sizeof(void *));
+    return 0;
+}
+```
 
-    /* Fixed-width types from <stdint.h> */
+```text output
+1 2 4 8 8
+4 8 8
+```
+
+## Unsigned overflow wraps
+
+Unsigned arithmetic is modulo 2^N, so `uint8_t` 255 plus one is 0. Signed
+overflow is undefined: the compiler may assume it never happens. Check
+before you add, or use the `__builtin_add_overflow` family.
+
+```c file=n02.c
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
     int32_t a = INT32_MAX;
     uint8_t u = 255;
     printf("%d %u\n", a, (unsigned)u);
-    u++; /* unsigned overflow wraps: well defined */
+    u++;
     printf("%u\n", (unsigned)u);
     printf("%d %d\n", INT_MIN, INT_MAX);
+    return 0;
+}
+```
 
-    /* Integer division truncates toward zero; % keeps the dividend's sign */
+```text output
+2147483647 255
+0
+-2147483648 2147483647
+```
+
+## Integer division truncates toward zero
+
+`7 / 2` is 3 and `-7 / 2` is `-3`, not floor division. `%` keeps the
+dividend's sign, so `-7 % 3` is `-1`. One floating operand makes `/` a
+real division.
+
+```c file=n03.c
+#include <stdio.h>
+
+int main(void) {
     printf("%d %d %d %f\n", 7 / 2, -7 / 2, -7 % 3, 7 / 2.0);
+    return 0;
+}
+```
 
-    /* Casts truncate; they do not round */
+```text output
+3 -3 -1 3.500000
+```
+
+## Casts truncate toward zero
+
+A cast from `double` to `int` drops the fraction. It does not round.
+`(int)-3.99` is `-3`.
+
+```c file=n04.c
+#include <stdio.h>
+
+int main(void) {
     double d = 3.99;
     printf("%d %d\n", (int)d, (int)-3.99);
+    return 0;
+}
+```
 
-    /* Signed -> unsigned conversion reinterprets modulo 2^N */
+```text output
+3 -3
+```
+
+## Signed values convert modulo 2^N
+
+`(unsigned)-1` is `UINT_MAX`, not a negative number. A mixed comparison
+such as `-1 < 1u` converts the signed side first, so it is false.
+`-Wsign-compare` (part of `-Wextra`) warns; the cast below makes the
+conversion obvious.
+
+```c file=n05.c
+#include <stdio.h>
+
+int main(void) {
     int neg = -1;
     unsigned pos = 1;
     printf("%u %d\n", (unsigned)neg, (unsigned)neg > pos);
+    return 0;
+}
+```
 
-    /* char is a small integer */
+```text output
+4294967295 1
+```
+
+## char is a small integer
+
+`'A'` is the code 65. Adding one moves to the next code. `char` may be
+signed or unsigned, depending on the platform; store bytes in
+`unsigned char` or `uint8_t`.
+
+```c file=n06.c
+#include <stdio.h>
+
+int main(void) {
     char c = 'A';
     printf("%c %d %c\n", c, c, c + 1);
+    return 0;
+}
+```
 
-    /* bool, and anything non-zero is true */
+```text output
+A 65 B
+```
+
+## Any non-zero value is true
+
+`bool` is an integer type that stores 0 or 1. The condition `5 > 3` is
+true. `!5` is false, because 5 is not zero.
+
+```c file=n07.c
+#include <stdbool.h>
+#include <stdio.h>
+
+int main(void) {
     bool ok = 5 > 3;
     printf("%d %d\n", ok, !5);
+    return 0;
+}
+```
 
-    /* enums are ints */
+```text output
+1 0
+```
+
+## Enums are ints
+
+An enumerator with no value is one past the previous one. `RED` is 0,
+`GREEN` is 5, and `BLUE` is 6.
+
+```c file=n08.c
+#include <stdio.h>
+
+enum Color { RED, GREEN = 5, BLUE };
+
+int main(void) {
     printf("%d %d %d\n", RED, GREEN, BLUE);
+    return 0;
+}
+```
 
-    /* Bit manipulation */
+```text output
+0 5 6
+```
+
+## Bits are flags
+
+`|=` sets a bit, `&` tests one, and `& ~mask` clears one. Shift a
+`1u`, not a signed `1`, so the bit pattern is unsigned.
+
+```c file=n09.c
+#include <stdio.h>
+
+int main(void) {
     unsigned flags = 0;
     flags |= 1u << 3;
     flags |= 1u << 0;
     printf("%u %d %u\n", flags, (flags & (1u << 3)) != 0, flags & ~1u);
-    printf("%x %X %o\n", 255, 255, 8);
+    return 0;
+}
+```
 
-    /* Floating point is binary */
+```text output
+9 1 8
+```
+
+## Floats are binary
+
+`0.1 + 0.2` is not `0.3`. A `float` also runs out of integer precision at
+2^24: `16777216.0f + 1.0f` is still `16777216.0f`.
+
+```c file=n10.c
+#include <stdio.h>
+
+int main(void) {
     printf("%.17g %d\n", 0.1 + 0.2, 0.1 + 0.2 == 0.3);
-    float f = 16777216.0f; /* 2^24: float runs out of integer precision */
+    float f = 16777216.0f;
     printf("%.1f\n", f + 1.0f);
+    return 0;
+}
+```
 
-    /* Macros substitute text; parenthesise everything */
+```text output
+0.30000000000000004 0
+16777216.0
+```
+
+## Macros substitute text
+
+`SQUARE(x + 1)` works only because every use of the argument, and the
+whole expression, is parenthesized. A macro is not a function: each
+argument is evaluated every time it appears, so `SQUARE(i++)` modifies
+`i` twice and is undefined.
+
+```c file=n11.c
+#include <stdio.h>
+
+#define SQUARE(x) ((x) * (x))
+
+int main(void) {
     int x = 3;
     printf("%d\n", SQUARE(x + 1));
+    return 0;
+}
+```
 
-    /* sizeof counts the terminating '\0' of a string literal */
+```text output
+16
+```
+
+## sizeof counts the terminator
+
+A string literal is a `char` array ending in `'\0'`. `sizeof` includes
+that byte. `strlen` does not.
+
+```c file=n12.c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
     printf("%zu %zu\n", sizeof "hello", strlen("hello"));
+    return 0;
+}
+```
 
+```text output
+6 5
+```
+
+## A wide shift needs a wide literal
+
+`1 << 40` is undefined when `1` is an `int`: the shift count is not
+smaller than the width. `1LL` is a `long long`, which can hold bit 40.
+
+```c file=n13.c
+#include <stdio.h>
+
+int main(void) {
     long long big = 1LL << 40;
     printf("%lld\n", big);
+    return 0;
+}
+```
 
-    /* printf formatting */
+```text output
+1099511627776
+```
+
+## printf pads, aligns, and picks a base
+
+The conversion must match the argument type. `%d` is `int`, `%u`
+unsigned, `%ld` long, `%lld` long long, `%zu` `size_t`, `%f` double
+(a `float` is promoted), and `%p` a pointer cast to `void *`. A mismatch
+is undefined. `%x`, `%X`, and `%o` print unsigned values in hex and octal.
+
+```c file=n14.c
+#include <stdio.h>
+
+int main(void) {
+    printf("%x %X %o\n", 255, 255, 8);
     printf("%5d|%-5d|%05d|%+d\n", 42, 42, 42, 42);
     printf("%8.3f|%e|%g\n", 3.14159, 1234.5678, 0.0001);
     printf("%c%c %s %10s|%-6s|\n", 'o', 'k', "str", "right", "left");
@@ -89,46 +300,12 @@ int main(void) {
 ```
 
 ```text output
-1 2 4 8 8
-4 8 8
-2147483647 255
-0
--2147483648 2147483647
-3 -3 -1 3.500000
-3 -3
-4294967295 1
-A 65 B
-1 0
-0 5 6
-9 1 8
 ff FF 10
-0.30000000000000004 0
-16777216.0
-16
-6 5
-1099511627776
    42|42   |00042|+42
    3.142|1.234568e+03|0.0001
 ok str      right|left  |
 ```
 
-## Details that bite
-
-- **Signed overflow is undefined behaviour**, not wraparound. The compiler
-  may assume it never happens. Unsigned overflow *is* defined (modulo 2^N).
-  Check before you add, or use the `__builtin_add_overflow` family.
-- `char` may be signed or unsigned depending on the platform; use
-  `unsigned char` / `uint8_t` for bytes.
-- Mixed signed/unsigned comparisons convert the signed side to unsigned:
-  `-1 < 1u` is **false**. `-Wextra` warns (`-Wsign-compare`).
-- Local variables are **uninitialised**; reading them is undefined.
-  Initialise at declaration.
-- A `printf` conversion that does not match the argument type is undefined
-  behaviour. `%d` int, `%u` unsigned, `%ld` long, `%lld` long long,
-  `%zu` size_t, `%f` double, `%p` pointer (cast to `void *`).
-- `=` assigns, `==` compares; `if (x = 5)` compiles. `-Wall` catches it.
-- Macros are not functions: arguments are evaluated each time they appear
-  (`SQUARE(i++)` is a bug).
 
 ## Exercises
 

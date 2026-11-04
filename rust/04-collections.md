@@ -1,68 +1,246 @@
 # Rust 04 — Collections
 
-Arrays are fixed-size, `Vec<T>` is the growable array, slices (`&[T]`) are
-borrowed views, and the standard library provides `HashMap`, `HashSet`,
-`BTreeMap`, `VecDeque` and more. The compiler guarantees you never
-invalidate an iterator.
+An array is fixed-size. `Vec<T>` grows. A slice (`&[T]`) borrows either of
+them. `HashMap`, `HashSet`, `BTreeMap`, and `VecDeque` cover the other
+shapes you reach for. The compiler will not let an iterator see a
+collection change under it.
 
-## Example
+## `Vec` grows at the end and in the middle
 
-```rust file=example.rs
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+`push` adds at the end. `insert` shifts elements right. Indexing with `v[i]`
+panics when `i` is out of range. `get` returns `None` instead. You cannot
+hold a reference into a `Vec` across a `push`: the push may reallocate, and
+the borrow checker rejects the pair.
 
+```rust file=n01.rs
 fn main() {
-    // Vec
     let mut v = vec![5, 2, 8, 1];
     v.push(9);
     v.insert(0, 7);
     println!("{v:?} {} {:?} {:?}", v.len(), v.first(), v.get(99));
+}
+```
+
+```text output
+[7, 5, 2, 8, 1, 9] 6 Some(7) None
+```
+
+## Sort, search, then keep what you want
+
+`sort` is ascending. `binary_search` needs that order and returns the index
+as `Ok`. `retain` drops elements in place. `pop` takes the last one.
+
+```rust file=n02.rs
+fn main() {
+    let mut v = vec![7, 5, 2, 8, 1, 9];
     v.sort();
     println!("{v:?} {:?}", v.binary_search(&5));
     v.retain(|&x| x % 2 == 1);
     println!("{v:?}");
-    println!("{:?} {:?}", &v[1..3], v.iter().rev().collect::<Vec<_>>());
     println!("{:?}", v.pop());
+}
+```
 
-    // Slices: windows, chunks
+```text output
+[1, 2, 5, 7, 8, 9] Ok(2)
+[1, 5, 7, 9]
+Some(9)
+```
+
+## A slice is a borrowed window
+
+`&v[1..3]` does not copy the elements out. `iter` yields `&T`. Reverse the
+iterator when you want the other direction without rearranging the `Vec`.
+
+```rust file=n03.rs
+fn main() {
+    let v = vec![1, 5, 7, 9];
+    println!("{:?} {:?}", &v[1..3], v.iter().rev().collect::<Vec<_>>());
+}
+```
+
+```text output
+[5, 7] [9, 7, 5, 1]
+```
+
+## `windows` and `chunks` group a slice
+
+`windows(2)` slides one element at a time and overlaps. `chunks(2)` cuts
+the slice into pieces that do not overlap. The last chunk is shorter when
+the length does not divide evenly.
+
+```rust file=n04.rs
+fn main() {
     let data = [1, 2, 3, 4, 5];
     println!("{:?}", data.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>());
     println!("{:?}", data.chunks(2).collect::<Vec<_>>());
+}
+```
 
-    // Arrays are Copy when their elements are
+```text output
+[1, 1, 1, 1]
+[[1, 2], [3, 4], [5]]
+```
+
+## Three iterators, three kinds of access
+
+`iter` yields `&T` and leaves the vector in place. `iter_mut` yields
+`&mut T`. `into_iter` yields `T` and consumes the vector.
+
+```rust file=n05.rs
+fn main() {
+    let mut v = vec![1, 2];
+    let refs: Vec<_> = v.iter().copied().collect();
+    for x in &mut v {
+        *x += 1;
+    }
+    let owned: Vec<_> = v.into_iter().collect();
+    println!("{refs:?} {owned:?}");
+}
+```
+
+```text output
+[1, 2] [2, 3]
+```
+
+## An array of `Copy` elements is `Copy`
+
+Assigning the array copies every byte. `[0u8; 4]` is four zeros, and both
+names stay usable. Call `Vec::with_capacity` when you know how many
+elements a vector will hold, so it does not grow one push at a time.
+
+```rust file=n06.rs
+fn main() {
     let a = [0u8; 4];
     let b = a;
-    println!("{a:?} {}", b.len());
+    let v = Vec::<i32>::with_capacity(4);
+    println!("{a:?} {} {}", b.len(), v.capacity() >= 4);
+}
+```
 
-    // Sorting with a comparator, dedup, 2-D
+```text output
+[0, 0, 0, 0] 4 true
+```
+
+## `sort_by` takes a comparator
+
+`cmp` then `then` builds a key out of two orderings: age descending, then
+name ascending.
+
+```rust file=n07.rs
+fn main() {
     let mut people = vec![("Al", 30), ("Bo", 25), ("Cy", 30)];
     people.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     println!("{people:?}");
+}
+```
+
+```text output
+[("Al", 30), ("Cy", 30), ("Bo", 25)]
+```
+
+## `dedup` only collapses neighbours
+
+Equal elements that are not next to each other stay. Sort first if you want
+every duplicate gone. `remove(i)` shifts the tail and is O(n). `swap_remove`
+is O(1) and does not keep the order.
+
+```rust file=n08.rs
+fn main() {
     let mut d = vec![1, 1, 2, 2, 3, 1];
     d.dedup();
     println!("{d:?}");
+    let mut v = vec![1, 2, 3, 4];
+    v.swap_remove(1);
+    println!("{v:?}");
+}
+```
+
+```text output
+[1, 2, 3, 1]
+[1, 4, 3]
+```
+
+## `vec![row; n]` clones each row
+
+Each inner `Vec` is its own allocation. Filling a grid this way does not
+alias the rows the way a copied pointer would in Python or C.
+
+```rust file=n09.rs
+fn main() {
     let mut grid = vec![vec![0; 3]; 2];
     grid[1][2] = 5;
     println!("{grid:?}");
+}
+```
 
-    // HashMap and the entry API
+```text output
+[[0, 0, 0], [0, 0, 5]]
+```
+
+## `HashMap` does not promise an order
+
+`entry` inserts a key only when it is missing, then gives you a mutable
+reference. Iteration order is arbitrary and can change between runs. Sort
+the keys, or use `BTreeMap`, when the output must be stable. Keys need
+`Eq + Hash`. `f64` is neither.
+
+```rust file=n10.rs
+use std::collections::HashMap;
+
+fn main() {
     let mut ages = HashMap::new();
     ages.insert("ann", 31);
     ages.insert("bob", 25);
-    println!("{:?} {:?} {}", ages.get("ann"), ages.get("zed"), ages.contains_key("bob"));
+    println!(
+        "{:?} {:?} {}",
+        ages.get("ann"),
+        ages.get("zed"),
+        ages.contains_key("bob")
+    );
     *ages.entry("ann").or_insert(0) += 1;
     ages.entry("cy").or_insert(40);
     let mut keys: Vec<_> = ages.keys().copied().collect();
     keys.sort();
     println!("{keys:?} {}", ages["ann"]);
+}
+```
 
-    // BTreeMap iterates in key order
+```text output
+Some(31) None true
+["ann", "bob", "cy"] 32
+```
+
+## `BTreeMap` walks keys in order
+
+`or_default` inserts the zero value (`0` for `usize`) when the key is new.
+The `Debug` output is sorted because the tree is.
+
+```rust file=n11.rs
+use std::collections::BTreeMap;
+
+fn main() {
     let mut counts: BTreeMap<char, usize> = BTreeMap::new();
     for c in "banana".chars() {
         *counts.entry(c).or_default() += 1;
     }
     println!("{counts:?}");
+}
+```
 
-    // Sets
+```text output
+{'a': 3, 'b': 1, 'n': 2}
+```
+
+## Sets know union and intersection
+
+`HashSet` is a `HashMap` whose values you never see. Collect the results
+and sort them: the set itself has no order.
+
+```rust file=n12.rs
+use std::collections::HashSet;
+
+fn main() {
     let s1: HashSet<i32> = [1, 2, 3].into_iter().collect();
     let s2: HashSet<i32> = [3, 4].into_iter().collect();
     let mut inter: Vec<_> = s1.intersection(&s2).collect();
@@ -70,8 +248,22 @@ fn main() {
     let mut uni: Vec<_> = s1.union(&s2).copied().collect();
     uni.sort();
     println!("{inter:?} {uni:?}");
+}
+```
 
-    // VecDeque: O(1) at both ends
+```text output
+[3] [1, 2, 3, 4]
+```
+
+## `VecDeque` is cheap at both ends
+
+`push_front` and `pop_front` are O(1). Use it for a queue. A `Vec` would
+shift every element to do the same thing.
+
+```rust file=n13.rs
+use std::collections::VecDeque;
+
+fn main() {
     let mut dq = VecDeque::new();
     dq.push_back(1);
     dq.push_back(2);
@@ -82,42 +274,9 @@ fn main() {
 ```
 
 ```text output
-[7, 5, 2, 8, 1, 9] 6 Some(7) None
-[1, 2, 5, 7, 8, 9] Ok(2)
-[1, 5, 7, 9]
-[5, 7] [9, 7, 5, 1]
-Some(9)
-[1, 1, 1, 1]
-[[1, 2], [3, 4], [5]]
-[0, 0, 0, 0] 4
-[("Al", 30), ("Cy", 30), ("Bo", 25)]
-[1, 2, 3, 1]
-[[0, 0, 0], [0, 0, 5]]
-Some(31) None true
-["ann", "bob", "cy"] 32
-{'a': 3, 'b': 1, 'n': 2}
-[3] [1, 2, 3, 4]
 [0, 1, 2]
 Some(0)
 ```
-
-## Details that bite
-
-- Indexing (`v[i]`) panics when out of bounds; use `get(i)` for a
-  `Option`.
-- `HashMap` iteration order is random (and differs per run); use
-  `BTreeMap` or sort the keys when you need determinism.
-- You cannot hold a reference into a `Vec` while pushing to it — the
-  borrow checker rejects it, because `push` may reallocate. Store indexes
-  or restructure.
-- `v.iter()` yields `&T`; `v.into_iter()` yields `T` and consumes `v`;
-  `v.iter_mut()` yields `&mut T`.
-- `HashMap` keys need `Eq + Hash`; `f64` is neither, so wrap it or use
-  integers.
-- `vec![x; n]` clones `x` n times: `vec![vec![0; 3]; 2]` is safe, unlike
-  the Python/C equivalents, because each row is its own `Vec`.
-- Prefer `Vec::with_capacity(n)` when the final size is known.
-- `Vec::remove(i)` is O(n); use `swap_remove` when order is irrelevant.
 
 ## Exercises
 

@@ -1,17 +1,22 @@
 # C 15 — Streaming
 
-`read` and `write` on a file, a pipe or a socket all return a count that can be shorter than you asked for. A zero `read` is end of stream. `fread` and `fwrite` are the same contract. Copy in a fixed buffer, and treat a frame that stops early as an error.
+`read` and `write` on a file, a pipe, or a socket all return a count that
+can be shorter than you asked for. A zero `read` is end of stream.
+`fread` and `fwrite` are the same contract. Copy through a fixed buffer.
+A frame that stops early is an error, not a partial success.
 
-## Example
+A short write must be retried from the first byte the callee did not
+accept. Calling `write` is not the same as those bytes being stored.
 
-```c file=example.c
-#define _POSIX_C_SOURCE 200809L
-#include <errno.h>
-#include <stdint.h>
+## Copy retries short reads and short writes
+
+The fake source gives at most 3 bytes per call. The fake sink accepts at
+most 2. The loop still moves all 11 bytes: 5 reads (the last is EOF) and
+7 writes. A negative count is a failure; zero ends the copy.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 struct mem {
     const unsigned char *data;
@@ -21,7 +26,7 @@ struct mem {
 static int mem_read(struct mem *m, unsigned char *dst, size_t n) {
     m->reads++;
     if (m->i >= m->len) {
-        return 0; /* clean EOF */
+        return 0;
     }
     if (n > m->limit) {
         n = m->limit;
@@ -52,7 +57,6 @@ static int sink_write(struct sink *s, const unsigned char *src, size_t n) {
     return (int)n;
 }
 
-/* Copy until EOF. Retries short writes. Returns byte count, or -1. */
 static int copy_chunks(struct mem *src, struct sink *dst, size_t size) {
     unsigned char buf[64];
     if (size > sizeof buf) {
@@ -79,7 +83,54 @@ static int copy_chunks(struct mem *src, struct sink *dst, size_t size) {
     }
 }
 
-/* Exactly n bytes. 1 on success, 0 on clean EOF before any byte, -1 if truncated. */
+int main(void) {
+    const unsigned char text[] = "hello world";
+    struct mem src = {.data = text, .len = 11, .limit = 3};
+    struct sink dst = {.limit = 2};
+    int n = copy_chunks(&src, &dst, 8);
+    printf("%d %zu %zu %.*s\n", n, src.reads, dst.writes, (int)dst.len, dst.buf);
+    return 0;
+}
+```
+
+```text output
+11 5 7 hello world
+```
+
+## A frame is a big-endian length and a body
+
+The `uint32` is the body length, so the other languages in this course
+can read the same bytes. Cap it before you allocate or copy. Two good
+frames print their text. The last header is only two of its four bytes:
+that is a truncated frame, so the result is -1 and there is no payload.
+A header that never arrives at all (zero bytes) is clean EOF, which
+`read_full` reports as 0.
+
+```c file=n02.c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+struct mem {
+    const unsigned char *data;
+    size_t len, i, limit;
+};
+
+static int mem_read(struct mem *m, unsigned char *dst, size_t n) {
+    if (m->i >= m->len) {
+        return 0;
+    }
+    if (n > m->limit) {
+        n = m->limit;
+    }
+    if (n > m->len - m->i) {
+        n = m->len - m->i;
+    }
+    memcpy(dst, m->data + m->i, n);
+    m->i += n;
+    return (int)n;
+}
+
 static int read_full(struct mem *src, unsigned char *dst, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -106,7 +157,6 @@ static uint32_t get_be32(const unsigned char *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-/* 1 and payload written to dst (capacity cap), 0 on clean EOF, -1 on a short frame. */
 static int read_frame(struct mem *src, unsigned char *dst, size_t cap, size_t *out_len) {
     unsigned char hdr[4];
     int rc = read_full(src, hdr, 4);
@@ -124,6 +174,51 @@ static int read_frame(struct mem *src, unsigned char *dst, size_t cap, size_t *o
     *out_len = n;
     return 1;
 }
+
+int main(void) {
+    unsigned char raw[64];
+    size_t len = 0;
+    put_be32(raw + len, 5);
+    len += 4;
+    memcpy(raw + len, "hello", 5);
+    len += 5;
+    put_be32(raw + len, 5);
+    len += 4;
+    memcpy(raw + len, "world", 5);
+    len += 5;
+    raw[len++] = 0;
+    raw[len++] = 0;
+    struct mem frames = {.data = raw, .len = len, .limit = 3};
+    unsigned char body[32];
+    size_t blen = 0;
+    int rc = read_frame(&frames, body, sizeof body, &blen);
+    printf("%d %.*s ", rc, (int)blen, body);
+    rc = read_frame(&frames, body, sizeof body, &blen);
+    printf("%d %.*s ", rc, (int)blen, body);
+    rc = read_frame(&frames, body, sizeof body, &blen);
+    printf("%d\n", rc);
+    return 0;
+}
+```
+
+```text output
+1 hello 1 world -1
+```
+
+## Replace a file by renaming in the same directory
+
+Write `path.tmp`, and check `fflush` and `fclose`: a buffered write can
+fail there even after `fwrite` returned the full count. `rename` onto
+the destination is atomic on one filesystem. The temporary name is gone
+afterwards, success or failure.
+
+```c file=n03.c
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 static int atomic_write(const char *path, const void *data, size_t n) {
     char tmp[320];
@@ -150,37 +245,8 @@ static int atomic_write(const char *path, const void *data, size_t n) {
 }
 
 int main(void) {
-    const unsigned char text[] = "hello world";
-    struct mem src = {.data = text, .len = 11, .limit = 3};
-    struct sink dst = {.limit = 2};
-    int n = copy_chunks(&src, &dst, 8);
-    printf("%d %zu %zu %.*s\n", n, src.reads, dst.writes, (int)dst.len, dst.buf);
-
-    unsigned char raw[64];
-    size_t len = 0;
-    put_be32(raw + len, 5);
-    len += 4;
-    memcpy(raw + len, "hello", 5);
-    len += 5;
-    put_be32(raw + len, 5);
-    len += 4;
-    memcpy(raw + len, "world", 5);
-    len += 5;
-    raw[len++] = 0;
-    raw[len++] = 0;
-    struct mem frames = {.data = raw, .len = len, .limit = 3};
-    unsigned char body[32];
-    size_t blen = 0;
-    int rc = read_frame(&frames, body, sizeof body, &blen);
-    printf("%d %.*s ", rc, (int)blen, body);
-    rc = read_frame(&frames, body, sizeof body, &blen);
-    printf("%d %.*s ", rc, (int)blen, body);
-    rc = read_frame(&frames, body, sizeof body, &blen);
-    printf("%d\n", rc);
-
     char dir[] = "/tmp/cstreamXXXXXX";
     if (!mkdtemp(dir)) {
-        perror("mkdtemp");
         return 1;
     }
     char path[64];
@@ -188,29 +254,114 @@ int main(void) {
         return 1;
     }
     if (atomic_write(path, "hello", 5) != 0) {
-        perror("atomic");
         return 1;
     }
     FILE *f = fopen(path, "rb");
     char got[16] = {0};
-    if (fread(got, 1, 5, f) != 5) {
+    if (!f || fread(got, 1, 5, f) != 5) {
         return 1;
     }
     fclose(f);
-    /* directory should contain only notes.txt, not the temp name */
-    int extras = 0;
-    /* cheap check: the temp path is gone */
     char tmp[80];
     if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", path) >= sizeof tmp) {
         return 1;
     }
     FILE *left = fopen(tmp, "rb");
+    int extras = 0;
     if (left) {
         extras = 1;
         fclose(left);
     }
     printf("notes.txt %s %s\n", got, extras ? "leftover" : "clean");
+    remove(path);
+    rmdir(dir);
+    return 0;
+}
+```
 
+```text output
+notes.txt hello clean
+```
+
+## A pipe is the same loop as a file
+
+The framed bytes are written to one end and read from the other until
+`read` returns zero. `read_frame` does not care that the source was a
+pipe. A socket uses this loop too.
+
+```c file=n04.c
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+struct mem {
+    const unsigned char *data;
+    size_t len, i, limit;
+};
+
+static int mem_read(struct mem *m, unsigned char *dst, size_t n) {
+    if (m->i >= m->len) {
+        return 0;
+    }
+    if (n > m->limit) {
+        n = m->limit;
+    }
+    if (n > m->len - m->i) {
+        n = m->len - m->i;
+    }
+    memcpy(dst, m->data + m->i, n);
+    m->i += n;
+    return (int)n;
+}
+
+static int read_full(struct mem *src, unsigned char *dst, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        int k = mem_read(src, dst + got, n - got);
+        if (k < 0) {
+            return -1;
+        }
+        if (k == 0) {
+            return got == 0 ? 0 : -1;
+        }
+        got += (size_t)k;
+    }
+    return 1;
+}
+
+static void put_be32(unsigned char *p, uint32_t n) {
+    p[0] = (unsigned char)(n >> 24);
+    p[1] = (unsigned char)(n >> 16);
+    p[2] = (unsigned char)(n >> 8);
+    p[3] = (unsigned char)n;
+}
+
+static uint32_t get_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static int read_frame(struct mem *src, unsigned char *dst, size_t cap, size_t *out_len) {
+    unsigned char hdr[4];
+    int rc = read_full(src, hdr, 4);
+    if (rc <= 0) {
+        return rc;
+    }
+    uint32_t n = get_be32(hdr);
+    if ((size_t)n > cap) {
+        return -1;
+    }
+    rc = read_full(src, dst, n);
+    if (rc <= 0) {
+        return -1;
+    }
+    *out_len = n;
+    return 1;
+}
+
+int main(void) {
     int fds[2];
     if (pipe(fds) != 0) {
         return 1;
@@ -222,7 +373,6 @@ int main(void) {
         return 1;
     }
     close(fds[1]);
-    /* read the pipe with the same full-read loop, via a one-shot buffer */
     unsigned char pipebuf[16];
     size_t pn = 0;
     while (pn < sizeof pipebuf) {
@@ -237,39 +387,18 @@ int main(void) {
     }
     close(fds[0]);
     struct mem piped = {.data = pipebuf, .len = pn, .limit = 5};
-    blen = 0;
-    rc = read_frame(&piped, body, sizeof body, &blen);
+    unsigned char body[32];
+    size_t blen = 0;
+    int rc = read_frame(&piped, body, sizeof body, &blen);
     printf("%d %.*s\n", rc, (int)blen, body);
-
-    remove(path);
-    rmdir(dir);
     return 0;
 }
 ```
 
 ```text output
-11 5 7 hello world
-1 hello 1 world -1
-notes.txt hello clean
 1 via-pipe
 ```
 
-## Details that bite
-
-- A short read is normal. End of stream is a zero-length read (or
-  `io.EOF` / `Ok(0)`). A header that stops after two of its four bytes is
-  a truncated frame: fail the frame, do not return a partial payload.
-- A short write must be retried from the first byte the callee did not
-  accept. "I called write" is not "those bytes are on the wire".
-- The length is a big-endian `uint32` of the **body**, so the other three
-  languages in this course can read the same bytes. Cap the length before
-  you allocate it.
-- Replace a file by writing a temporary in the **same directory** and
-  renaming it over the destination. `rename` is atomic on one filesystem.
-  Check the error from flush and from close; a buffered writer can fail
-  there, after `write` returned success.
-- The copy loop is what `io.Copy`, `std::io::copy` and a `fread`/`fwrite`
-  pair are. A pipe and a socket use the same loop as the file.
 
 ## Exercises
 
@@ -277,6 +406,7 @@ notes.txt hello clean
 
 ```c file=exercise.c
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -442,6 +572,7 @@ int main(void) {
 
 ```c file=solution.c
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

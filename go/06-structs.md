@@ -1,43 +1,168 @@
 # Go 06 — Structs and Methods
 
 Go has no classes. You get structs (data), methods (functions with a
-receiver), and embedding (composition that looks like inheritance).
+receiver), and embedding (composition that looks like inheritance). A name
+is exported when it starts with an uppercase letter. The same rule covers
+functions, types, and methods.
 
-## Example
+## A value receiver sees a copy
 
-```go file=example.go
+The method gets its own `Point`. Callers keep the original. If any method
+on the type needs a pointer receiver, give them all pointer receivers: a
+value stored in an interface has only the value-receiver methods.
+
+```go file=n01.go
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 )
 
 type Point struct{ X, Y float64 }
 
-// Value receiver: works on a copy.
 func (p Point) Dist(q Point) float64 { return math.Hypot(p.X-q.X, p.Y-q.Y) }
 
-// Pointer receiver: can modify the original.
+func main() {
+	p := Point{3, 4}
+	fmt.Println(p.X, p.Y, p.Dist(Point{}))
+}
+```
+
+```text output
+3 4 5
+```
+
+## `String` customises printing
+
+A `String() string` method satisfies `fmt.Stringer`. `Println` calls it
+instead of printing the fields.
+
+```go file=n02.go
+package main
+
+import "fmt"
+
+type Point struct{ X, Y float64 }
+
+func (p Point) String() string { return fmt.Sprintf("(%g,%g)", p.X, p.Y) }
+
+func main() {
+	fmt.Println(Point{3, 4})
+}
+```
+
+```text output
+(3,4)
+```
+
+## A pointer receiver can modify
+
+`Scale` writes the caller's fields. When `p` is a variable, `p.Scale(2)`
+is short for `(&p).Scale(2)`. A pointer method is not in the method set of
+a plain value inside an interface.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
+type Point struct{ X, Y float64 }
+
+func (p Point) String() string { return fmt.Sprintf("(%g,%g)", p.X, p.Y) }
+
 func (p *Point) Scale(k float64) {
 	p.X *= k
 	p.Y *= k
 }
 
-// Implementing fmt.Stringer customises printing.
+func main() {
+	p := Point{3, 4}
+	p.Scale(2)
+	fmt.Println(p)
+
+	pp := &Point{1, 1}
+	pp.Scale(3)
+	fmt.Println(*pp, pp)
+}
+```
+
+```text output
+(6,8)
+(3,3) (3,3)
+```
+
+## A method value binds the receiver
+
+`pp.Scale` is a function that already knows which point to change. Calling
+it is the same as calling the method.
+
+```go file=n04.go
+package main
+
+import "fmt"
+
+type Point struct{ X, Y float64 }
+
 func (p Point) String() string { return fmt.Sprintf("(%g,%g)", p.X, p.Y) }
 
-type Config struct {
-	Host string
-	Port int
+func (p *Point) Scale(k float64) {
+	p.X *= k
+	p.Y *= k
 }
+
+func main() {
+	pp := &Point{1, 1}
+	scale := pp.Scale
+	scale(2)
+	fmt.Println(pp)
+}
+```
+
+```text output
+(2,2)
+```
+
+## Assignment copies the struct
+
+`q := p` duplicates the fields. `==` compares them, and it compiles only
+when every field is comparable.
+
+```go file=n05.go
+package main
+
+import "fmt"
+
+type Point struct{ X, Y float64 }
+
+func main() {
+	p := Point{3, 4}
+	q := p
+	q.X = 0
+	fmt.Println(p.X, Point{1, 2} == Point{1, 2})
+}
+```
+
+```text output
+3 true
+```
+
+## Embedding promotes fields and methods
+
+`Dog` contains an `Animal`. `d.Name` and `d.Animal.Speak` are promoted, but
+`Dog` is not an `Animal` and does not convert to one. `Speak` on `Dog`
+overrides the promoted method; the inner one is still there under its type
+name.
+
+```go file=n06.go
+package main
+
+import "fmt"
 
 type Animal struct{ Name string }
 
 func (a Animal) Speak() string { return a.Name + " makes a sound" }
 
-// Embedding promotes the fields and methods of Animal into Dog.
 type Dog struct {
 	Animal
 	Breed string
@@ -45,7 +170,29 @@ type Dog struct {
 
 func (d Dog) Speak() string { return d.Animal.Speak() + " (woof)" }
 
-// Keep invariants with unexported fields and a constructor.
+func main() {
+	d := Dog{Animal{"Rex"}, "lab"}
+	fmt.Println(d.Speak(), d.Name)
+	fmt.Printf("%T\n", d)
+}
+```
+
+```text output
+Rex makes a sound (woof) Rex
+main.Dog
+```
+
+## Unexported fields protect an invariant
+
+`balance` is visible only inside the package. Callers go through
+`NewAccount`, `Deposit`, and `Balance`, so a negative deposit can be
+refused.
+
+```go file=n07.go
+package main
+
+import "fmt"
+
 type Account struct {
 	owner   string
 	balance int
@@ -63,79 +210,95 @@ func (a *Account) Deposit(n int) bool {
 
 func (a *Account) Balance() int { return a.balance }
 
-type User struct {
-	Name  string `json:"name"`
-	Email string `json:"email,omitempty"`
-	age   int    // unexported: ignored by encoding/json
-}
-
 func main() {
-	p := Point{3, 4}
-	fmt.Println(p, p.Dist(Point{}))
-	p.Scale(2) // p is addressable, so Go takes &p for you
-	fmt.Println(p)
-
-	pp := &Point{1, 1}
-	pp.Scale(3)
-	fmt.Println(*pp, pp)
-
-	scale := pp.Scale // method value bound to pp
-	scale(2)
-	fmt.Println(pp)
-
-	q := p // structs are copied on assignment
-	q.X = 0
-	fmt.Println(p.X, Point{1, 2} == Point{1, 2})
-
-	fmt.Printf("%+v\n", Config{"h", 80})
-	var zero Config
-	fmt.Printf("%+v\n", zero)
-
-	d := Dog{Animal{"Rex"}, "lab"}
-	fmt.Println(d.Speak(), d.Name)
-
 	acct := NewAccount("ada")
 	acct.Deposit(50)
 	fmt.Println(acct.Deposit(-1), acct.Balance())
+}
+```
 
+```text output
+false 50
+```
+
+## The zero value should be useful
+
+Design the type so `var x T` is already valid. `%+v` prints field names,
+including the zeros you did not set.
+
+```go file=n08.go
+package main
+
+import "fmt"
+
+type Config struct {
+	Host string
+	Port int
+}
+
+func main() {
+	fmt.Printf("%+v\n", Config{"h", 80})
+	var zero Config
+	fmt.Printf("%+v\n", zero)
+}
+```
+
+```text output
+{Host:h Port:80}
+{Host: Port:0}
+```
+
+## An anonymous struct needs no named type
+
+The type is written at the variable. It is useful for a one-off shape that
+no other function has to name.
+
+```go file=n09.go
+package main
+
+import "fmt"
+
+func main() {
 	anon := struct {
 		A int
 		B string
 	}{1, "x"}
 	fmt.Println(anon)
+}
+```
 
+```text output
+{1 x}
+```
+
+## JSON uses tags and skips unexported fields
+
+The tag renames the field. `omitempty` drops an empty exported field.
+`age` starts with a lowercase letter, so `encoding/json` ignores it.
+
+```go file=n10.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type User struct {
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+	age   int
+}
+
+func main() {
 	out, _ := json.Marshal(User{Name: "Ada", age: 3})
 	fmt.Println(string(out))
 }
 ```
 
 ```text output
-(3,4) 5
-(6,8)
-(3,3) (3,3)
-(6,6)
-6 true
-{Host:h Port:80}
-{Host: Port:0}
-Rex makes a sound (woof) Rex
-false 50
-{1 x}
 {"name":"Ada"}
 ```
-
-## Details that bite
-
-- Choose receivers consistently: if any method needs a pointer receiver
-  (mutation, or a big struct), use pointer receivers for all of them.
-- A value stored in an interface only has the *value-receiver* methods; the
-  pointer type has both. This is why `var s Shape = &Rect{}` is often
-  required.
-- Embedding is not inheritance: `Dog` is not an `Animal`. You cannot pass a
-  `Dog` where an `Animal` is wanted, only call promoted methods.
-- Struct comparison with `==` works only if all fields are comparable.
-- Zero values should be useful. Design types so `var x T` works.
-- Fields are exported if they start with an uppercase letter; the same rule
-  governs functions, types and methods.
 
 ## Exercises
 

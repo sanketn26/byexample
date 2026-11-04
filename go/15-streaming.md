@@ -1,20 +1,25 @@
 # Go 15 — Streaming
 
-A file, a pipe and a socket are the same shape: an `io.Reader` and an `io.Writer` that deliver bytes in pieces. `Read` may return fewer bytes than the buffer. `Write` may accept fewer than you offered. `io.Copy` is the loop below.
+A file, a pipe, and a socket are the same shape: an `io.Reader` and an
+`io.Writer` that deliver bytes in pieces. `Read` may return fewer bytes
+than the buffer. `Write` may accept fewer than you offered. A short read
+is normal. End of stream is `io.EOF`. The loop below is what `io.Copy`,
+and the copy helpers in the other languages of this course, actually do.
 
-## Example
+## Copy until every short write is accepted
 
-```go file=example.go
+A short write must be retried from the first byte the callee did not take.
+"I called Write" is not "those bytes are stored". This reader returns at
+most 3 bytes, and this writer accepts at most 2, so one `Copy` would be
+wrong. The counts are the reads and the writes it took to move 11 bytes.
+
+```go file=n01.go
 package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 type shortReader struct {
@@ -85,6 +90,59 @@ func copyChunks(src io.Reader, dst io.Writer, size int) (int, error) {
 	}
 }
 
+func main() {
+	src := &shortReader{data: []byte("hello world"), limit: 3}
+	dst := &shortWriter{limit: 2}
+	n, err := copyChunks(src, dst, 8)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(n, src.reads, dst.writes, dst.buf.String())
+}
+```
+
+```text output
+11 5 7 hello world
+```
+
+## A frame is a length and then a body
+
+The length is a big-endian `uint32` of the body, so the other languages in
+this course can read the same bytes. Cap that length before you allocate
+it. `readFull` loops until it has every byte. `io.EOF` before any byte of
+a frame means there is no next frame.
+
+```go file=n02.go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+type shortReader struct {
+	data  []byte
+	limit int
+	i     int
+}
+
+func (r *shortReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.limit {
+		n = r.limit
+	}
+	if n > len(r.data)-r.i {
+		n = len(r.data) - r.i
+	}
+	copy(p, r.data[r.i:r.i+n])
+	r.i += n
+	return n, nil
+}
+
 func readFull(src io.Reader, n int) ([]byte, error) {
 	buf := make([]byte, n)
 	got := 0
@@ -120,6 +178,129 @@ func readFrame(src io.Reader) ([]byte, error) {
 	return readFull(src, int(n))
 }
 
+func main() {
+	raw := append(encodeFrame([]byte("hello")), encodeFrame([]byte("world"))...)
+	stream := &shortReader{data: raw, limit: 3}
+	a, err := readFrame(stream)
+	if err != nil {
+		panic(err)
+	}
+	b, err := readFrame(stream)
+	if err != nil {
+		panic(err)
+	}
+	_, err = readFrame(stream)
+	fmt.Printf("%s %s %v\n", a, b, err)
+}
+```
+
+```text output
+hello world EOF
+```
+
+## A truncated header is not a payload
+
+Two bytes of a four-byte length, then end of stream, is
+`io.ErrUnexpectedEOF`. Fail the frame. Do not return a partial body.
+
+```go file=n03.go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+type shortReader struct {
+	data  []byte
+	limit int
+	i     int
+}
+
+func (r *shortReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if n > r.limit {
+		n = r.limit
+	}
+	if n > len(r.data)-r.i {
+		n = len(r.data) - r.i
+	}
+	copy(p, r.data[r.i:r.i+n])
+	r.i += n
+	return n, nil
+}
+
+func readFull(src io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	got := 0
+	for got < n {
+		k, err := src.Read(buf[got:])
+		got += k
+		if err != nil {
+			if err == io.EOF && got == 0 {
+				return nil, io.EOF
+			}
+			if err == io.EOF {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+func encodeFrame(payload []byte) []byte {
+	buf := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(buf, uint32(len(payload)))
+	copy(buf[4:], payload)
+	return buf
+}
+
+func readFrame(src io.Reader) ([]byte, error) {
+	header, err := readFull(src, 4)
+	if err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(header)
+	return readFull(src, int(n))
+}
+
+func main() {
+	raw := append(encodeFrame([]byte("hello")), 0, 0)
+	stream := &shortReader{data: raw, limit: 3}
+	if _, err := readFrame(stream); err != nil {
+		panic(err)
+	}
+	_, err := readFrame(stream)
+	fmt.Println(err)
+}
+```
+
+```text output
+unexpected EOF
+```
+
+## Rename a temp file in the same directory
+
+`rename` on one filesystem replaces the destination atomically. Write the
+temporary beside the target, and check the error from `Write` and from
+`Close`. A buffered writer can fail there, after `Write` returned success.
+On any failure, remove the temporary so it is not left behind.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
 func atomicWrite(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
@@ -145,28 +326,6 @@ func atomicWrite(path string, data []byte) error {
 }
 
 func main() {
-	src := &shortReader{data: []byte("hello world"), limit: 3}
-	dst := &shortWriter{limit: 2}
-	n, err := copyChunks(src, dst, 8)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(n, src.reads, dst.writes, dst.buf.String())
-
-	raw := append(encodeFrame([]byte("hello")), encodeFrame([]byte("world"))...)
-	raw = append(raw, 0, 0) // two bytes of a header, then EOF
-	stream := &shortReader{data: raw, limit: 3}
-	a, err := readFrame(stream)
-	if err != nil {
-		panic(err)
-	}
-	b, err := readFrame(stream)
-	if err != nil {
-		panic(err)
-	}
-	_, err = readFrame(stream)
-	fmt.Printf("%s %s %v\n", a, b, err)
-
 	dir, err := os.MkdirTemp("", "stream")
 	if err != nil {
 		panic(err)
@@ -180,9 +339,68 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Println("notes.txt", strings.TrimSpace(string(got)), len(entries) == 1)
+}
+```
 
+```text output
+notes.txt hello true
+```
+
+## A pipe uses the same frame reader
+
+`io.Pipe` is an in-memory stream. The writer runs in another goroutine
+because a pipe blocks when its buffer is full. `readFrame` does not care
+that the bytes came from a pipe instead of a slice.
+
+```go file=n05.go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
+func readFull(src io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	got := 0
+	for got < n {
+		k, err := src.Read(buf[got:])
+		got += k
+		if err != nil {
+			if err == io.EOF && got == 0 {
+				return nil, io.EOF
+			}
+			if err == io.EOF {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
+func encodeFrame(payload []byte) []byte {
+	buf := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(buf, uint32(len(payload)))
+	copy(buf[4:], payload)
+	return buf
+}
+
+func readFrame(src io.Reader) ([]byte, error) {
+	header, err := readFull(src, 4)
+	if err != nil {
+		return nil, err
+	}
+	return readFull(src, int(binary.BigEndian.Uint32(header)))
+}
+
+func main() {
 	pr, pw := io.Pipe()
 	go func() {
 		_, _ = pw.Write(encodeFrame([]byte("via-pipe")))
@@ -197,28 +415,8 @@ func main() {
 ```
 
 ```text output
-11 5 7 hello world
-hello world unexpected EOF
-notes.txt hello true
 via-pipe
 ```
-
-## Details that bite
-
-- A short read is normal. End of stream is a zero-length read (or
-  `io.EOF` / `Ok(0)`). A header that stops after two of its four bytes is
-  a truncated frame: fail the frame, do not return a partial payload.
-- A short write must be retried from the first byte the callee did not
-  accept. "I called write" is not "those bytes are on the wire".
-- The length is a big-endian `uint32` of the **body**, so the other three
-  languages in this course can read the same bytes. Cap the length before
-  you allocate it.
-- Replace a file by writing a temporary in the **same directory** and
-  renaming it over the destination. `rename` is atomic on one filesystem.
-  Check the error from flush and from close; a buffered writer can fail
-  there, after `write` returned success.
-- The copy loop is what `io.Copy`, `std::io::copy` and a `fread`/`fwrite`
-  pair are. A pipe and a socket use the same loop as the file.
 
 ## Exercises
 

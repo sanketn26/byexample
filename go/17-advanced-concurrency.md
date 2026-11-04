@@ -1,37 +1,47 @@
 # Go 17 — Advanced concurrency
 
-A goroutine per request, with nothing to stop it and nowhere for work to queue, fails by exhausting memory. Bound the workers, bound the queue, put a `context` deadline on the whole operation, and make shutdown visible. This is the shape of a server in front of the sockets from the previous lesson.
+A goroutine per request, with nothing to stop it and nowhere for work to
+queue, fails by exhausting memory or file descriptors. Bound how many
+workers run, and bound how many jobs sit in the queue. A deadline has to
+cover the whole operation: a 150ms read timeout inside a transfer that
+retries forever is not one. Cancellation is cooperative. Cancelling a
+context does nothing to a worker blocked in a syscall until that syscall
+is also interruptible: close the connection, or give the read its own
+deadline. Join the workers before the process exits. An async runtime puts
+a scheduler under this shape; it does not remove the bound, the deadline,
+or the shutdown.
 
-## Example
+## Bound the workers and watch the high-water mark
 
-```go file=example.go
+Two workers pull from one queue. The gate holds the first wave inside the
+job until that many have entered, so the high-water mark does not depend
+on the scheduler. `max` is the number you have to be able to explain. A
+blocking send hides a full queue on a goroutine you may not be able to
+spare; the next nugget refuses instead.
+
+```go file=n01.go
 package main
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
-func runPool(workers int, jobs []int) ([]int, int) {
+func main() {
+	jobs := []int{0, 1, 2, 3}
 	type item struct{ i, job int }
 	q := make(chan item)
 	results := make([]int, len(jobs))
 	var mu sync.Mutex
 	cur, maxIn := 0, 0
-	need := workers
-	if need > len(jobs) {
-		need = len(jobs)
-	}
 	var arrived sync.WaitGroup
-	arrived.Add(need)
+	arrived.Add(2)
 	var seen atomic.Int32
 	gate := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(workers)
-	for range workers {
+	for range 2 {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for it := range q {
@@ -41,7 +51,7 @@ func runPool(workers int, jobs []int) ([]int, int) {
 					maxIn = cur
 				}
 				mu.Unlock()
-				if int(seen.Add(1)) <= need {
+				if seen.Add(1) <= 2 {
 					arrived.Done()
 				}
 				<-gate
@@ -61,13 +71,30 @@ func runPool(workers int, jobs []int) ([]int, int) {
 	arrived.Wait()
 	close(gate)
 	wg.Wait()
-	return results, maxIn
+	fmt.Println("pool", results, maxIn)
 }
+```
+
+```text output
+pool [0 1 4 9] 2
+```
+
+## A deadline covers the whole wait
+
+`WithTimeout` ends the `select` even though `never` has no sender. The
+error is the deadline, not a value. `context`, a receive timeout, and
+`poll` are the same idea: one clock for the operation.
+
+```go file=n02.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
 func main() {
-	results, maxIn := runPool(2, []int{0, 1, 2, 3})
-	fmt.Println("pool", results, maxIn)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	never := make(chan struct{})
@@ -77,7 +104,26 @@ func main() {
 	case <-never:
 		fmt.Println("unexpected")
 	}
+}
+```
 
+```text output
+deadline
+```
+
+## A full buffer is backpressure
+
+The channel holds two ints. The `default` arm runs when the third send
+would block, and the producer learns immediately. A blocking send would
+hide that fact. The same choice is `try_send` or a ring that refuses the
+next push.
+
+```go file=n03.go
+package main
+
+import "fmt"
+
+func main() {
 	buf := make(chan int, 2)
 	accepted := 0
 	for i := 0; i < 5; i++ {
@@ -88,17 +134,39 @@ func main() {
 		}
 	}
 	fmt.Println("accepted", accepted)
+}
+```
 
+```text output
+accepted 2
+```
+
+## Shutdown leaves the queued jobs in place
+
+The workers are alive, blocked on the context. Cancel tells them to stop.
+They exit without taking the four queued values, and `stopped 4` is the
+caller deciding whether to drop or drain. Join them before `main` returns.
+
+```go file=n04.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+)
+
+func main() {
 	work := make(chan int, 4)
 	for i := 0; i < 4; i++ {
 		work <- i
 	}
-	stop, cancelStop := context.WithCancel(context.Background())
+	stop, cancel := context.WithCancel(context.Background())
 	var started sync.WaitGroup
 	started.Add(2)
 	var wg sync.WaitGroup
-	wg.Add(2)
 	for range 2 {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			started.Done()
@@ -106,43 +174,15 @@ func main() {
 		}()
 	}
 	started.Wait()
-	cancelStop()
+	cancel()
 	wg.Wait()
 	fmt.Println("stopped", len(work))
 }
 ```
 
 ```text output
-pool [0 1 4 9] 2
-deadline
-accepted 2
 stopped 4
 ```
-
-## Details that bite
-
-- Bound two numbers: how many workers run, and how many jobs sit in the
-  queue. One thread, goroutine or task per request, with no ceiling,
-  dies by running out of memory or file descriptors.
-- `max` in the pool output is the number you have to be able to explain.
-  The example holds the first wave of workers inside the job until that
-  many have entered, so the high-water mark is observable instead of
-  depending on the scheduler.
-- A full bounded channel (`put_nowait`, `select`/`default`, `try_send`,
-  a ring that refuses the next push) is backpressure. The producer hears
-  about it now. A blocking send hides the problem on a thread you may
-  not be able to spare.
-- A deadline covers the whole operation. A 150ms read timeout inside a
-  transfer that retries forever is not one. `context`, `recv_timeout`
-  and `poll` are the same idea.
-- Cancellation is cooperative. Cancelling a context or setting a flag
-  does nothing to a worker blocked in a syscall until that syscall is
-  also interruptible: close the fd, or give the read its own deadline.
-  The example's workers are alive, then told to stop, and the four
-  queued jobs stay queued (`stopped 4`) for the caller to drop or drain.
-- Join the workers before the process exits. Rust async runtimes add a
-  scheduler under this shape; they do not remove the bound, the deadline
-  or the shutdown.
 
 ## Exercises
 

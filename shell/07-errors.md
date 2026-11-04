@@ -1,55 +1,213 @@
 # Shell 07 — Errors and Robust Scripts
 
-By default a shell script **keeps going after a failure**, uses unset
-variables as empty strings, and reports a pipeline's last status only.
-Production scripts opt out of all three, clean up after themselves, and
-fail loudly.
+By default a shell script keeps going after a failure, treats unset
+variables as empty, and reports only a pipeline's last status.
+Production scripts opt out of all three, clean up after themselves,
+and fail loudly. Print errors to stderr. Leave stdout for data.
 
-## Example
+## `set -e` exits when a command fails
 
-```bash file=example.sh
-#!/usr/bin/env bash
-# The "strict mode" header. Know what each switch does:
-#   -e          exit when a command fails (with exceptions, see below)
-#   -u          error on use of an unset variable
-#   -o pipefail a pipeline fails if ANY stage fails
-set -euo pipefail
+The flag has holes, below. It is not a substitute for checking the
+commands you care about.
 
-die() { echo "error: $*" >&2; exit 1; }
-
-# 1. Run a risky part in a subshell so the demo can continue
+```bash file=n01.sh
 attempt() { ( "$@" ) 2>&1 || echo "  -> exited with $?"; }
-
 attempt bash -c 'set -e; echo before; false; echo "never printed"'
+```
+
+```text output
+before
+  -> exited with 1
+```
+
+## `set -e` is off for the test of an `if`
+
+It is also off for `&&` and `||` lists, for `!`, and for the body of
+a function called from any of those. A function that "fails fast"
+silently stops doing so when you write `if myfunc; then`.
+
+```bash file=n02.sh
+set -e
+f() { false; echo "function kept going"; }
+if f; then echo "called from if"; fi
+false && echo "and-skipped"
+echo "script kept going"
+```
+
+```text output
+function kept going
+called from if
+script kept going
+```
+
+## `set -u` rejects an unset name
+
+A missing `$1` is that error. `${1:-}` allows it. `${1:?message}`
+requires it and aborts with your text.
+
+```bash file=n03.sh
+attempt() { ( "$@" ) 2>&1 || echo "  -> exited with $?"; }
 attempt bash -c 'set -u; echo "value: $undefined_var"'
+set -u
+echo "empty <${1:-}>"
+```
+
+```text output
+bash: line 1: undefined_var: unbound variable
+  -> exited with 127
+empty <>
+```
+
+## `pipefail` fails when any stage fails
+
+Without it, `false | cat` succeeds because `cat` succeeded. With
+`set -e` and `pipefail`, the script stops.
+
+```bash file=n04.sh
+attempt() { ( "$@" ) 2>&1 || echo "  -> exited with $?"; }
 attempt bash -c 'set -eo pipefail; false | cat; echo "never printed"'
+```
 
-# 2. Handle an expected failure explicitly
+```text output
+  -> exited with 1
+```
+
+## Three failures `set -e` does not see
+
+`local v=$(failing)` hides the status behind `local`. The left side
+of a pipeline is ignored without `pipefail`. `(( expr ))` fails when
+the value is 0, including `(( count++ ))` from 0.
+
+```bash file=n05.sh
+set -e
+hide() { local v=$(false); echo "local hid it"; }
+hide
+echo "after local"
+false | cat
+echo "pipeline survived"
+bash -c 'set -e; count=0; (( count++ )); echo survived' || echo "arithmetic aborted"
+```
+
+```text output
+local hid it
+after local
+pipeline survived
+arithmetic aborted
+```
+
+## An expected failure is a branch, not a crash
+
+`if`, `|| true`, and a saved status are three ways to keep going on
+purpose. `grep` exits 1 when the pattern is absent.
+
+```bash file=n06.sh
+set -e
 if ! grep -q zebra <<< "apple banana"; then echo "no zebra, carrying on"; fi
-grep -q zebra <<< "apple banana" || true      # ignore on purpose
-rc=0; grep -q zebra <<< "apple" || rc=$?      # capture on purpose
+grep -q zebra <<< "apple banana" || true
+rc=0
+grep -q zebra <<< "apple" || rc=$?
 echo "grep exit: $rc"
+```
 
-# 3. trap EXIT runs on success, failure, and Ctrl-C: the place for cleanup
+```text output
+no zebra, carrying on
+grep exit: 1
+```
+
+## `trap EXIT` is the cleanup hook
+
+It runs on success, on failure, and on Ctrl-C. Always `mktemp`. A
+fixed `/tmp/name` is a race and a security hole. `exit` inside
+`$(...)` or a pipeline stage exits only that subshell.
+
+```bash file=n07.sh
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"; echo "cleaned up"' EXIT
+cleanup() { rm -rf "$tmp"; echo "cleaned up"; }
+trap cleanup EXIT
 echo "work" > "$tmp/data"
 [[ -f $tmp/data ]] && echo "temp file exists"
+```
 
-# 4. trap ERR reports where a failure happened (bash only)
+```text output
+temp file exists
+cleaned up
+```
+
+## A second EXIT trap replaces the first
+
+Compose one `cleanup` function and trap that. Do not stack traps.
+They do not stack.
+
+```bash file=n08.sh
+trap 'echo first' EXIT
+trap 'echo second' EXIT
+```
+
+```text output
+second
+```
+
+## `exit` in a substitution leaves the parent running
+
+The subshell is the one that exits. With `set -e`, a failing
+substitution used only as an argument of `echo` does not abort the
+script either. Check the status if you need it.
+
+```bash file=n09.sh
+set +e
+out=$(echo hi; exit 9)
+echo "status $? value $out"
+set -e
+echo "captured $(echo hi; exit 9)"
+echo "parent still here"
+```
+
+```text output
+status 9 value hi
+captured hi
+parent still here
+```
+
+## `trap ERR` names the failing command
+
+This trap is bash-only. `$LINENO` and `$BASH_COMMAND` are the line
+and the text that failed. `set -e` then skips the rest.
+
+```bash file=n10.sh
 bash <<'INNER' || true
 trap 'echo "failed at line $LINENO: $BASH_COMMAND"' ERR
 set -e
 ls /nonexistent-dir 2>/dev/null
 echo never
 INNER
+```
 
-# 5. Required arguments and variables
-usage() { echo "usage: $0 NAME" >&2; }
+```text output
+failed at line 3: ls /nonexistent-dir 2> /dev/null
+```
+
+## `${1:?msg}` demands an argument
+
+The message goes to stderr. The status is non-zero. In a subshell,
+that failure does not kill the caller.
+
+```bash file=n11.sh
 name_or_die() { echo "${1:?missing NAME}"; }
 ( name_or_die ) 2>&1 | sed 's/^.*: //' || true
+```
 
-# 6. Validate input before using it
+```text output
+missing NAME
+```
+
+## Validate before you use the value
+
+A pattern for the shape, then a range for the meaning. Print the
+problem to stderr and return non-zero. Do not echo a bad value on
+stdout, where a pipeline would treat it as data.
+
+```bash file=n12.sh
+set -euo pipefail
 parse_port() {
   local p=$1
   [[ $p =~ ^[0-9]+$ ]] || { echo "bad port: $p" >&2; return 1; }
@@ -59,10 +217,24 @@ parse_port() {
 parse_port 8080
 parse_port abc 2>&1 || true
 parse_port 70000 2>&1 || true
+```
 
-# 7. retry with backoff: a function that takes a command
+```text output
+8080
+bad port: abc
+port out of range: 70000
+```
+
+## Retry the command, not the whole script
+
+Sleep between tries in real code. A delay of `0` keeps the demo
+instant. The status of the last try is the function's status.
+
+```bash file=n13.sh
+set -euo pipefail
 retry() {
-  local n=$1 delay=$2; shift 2
+  local n=$1 delay=$2
+  shift 2
   local i
   for ((i = 1; i <= n; i++)); do
     "$@" && return 0
@@ -74,50 +246,41 @@ retry() {
 flaky_count=0
 flaky() { (( ++flaky_count >= 3 )); }
 retry 5 0 flaky 2>&1 && echo "succeeded after $flaky_count tries"
-
-echo "done"
 ```
 
 ```text output
-before
-  -> exited with 1
-bash: line 1: undefined_var: unbound variable
-  -> exited with 127
-  -> exited with 1
-no zebra, carrying on
-grep exit: 1
-temp file exists
-failed at line 3: ls /nonexistent-dir 2> /dev/null
-missing NAME
-8080
-bad port: abc
-port out of range: 70000
 attempt 1/5 failed
 attempt 2/5 failed
 succeeded after 3 tries
-done
-cleaned up
 ```
 
-## Details that bite
+## Exit codes are a small vocabulary
 
-- `set -e` is **ignored** inside `if` conditions, `&&`/`||` lists, `!`
-  negations and any function called from them. A function that "fails
-  fast" under `set -e` silently stops doing so when you call it as
-  `if myfunc; then`.
-- `set -e` does not trigger for `local v=$(failing)`, for the left side of
-  a pipeline without `pipefail`, or for `(( expr ))` evaluating to 0.
-  Do not lean on it for control flow; check what matters explicitly.
-- `set -u` makes `$1` an error when no argument was given. Use `${1:-}`
-  (or `${1:?message}` to *require* it).
-- `trap ... EXIT` replaces any earlier EXIT trap. Compose: keep one
-  `cleanup` function and trap that.
-- `exit` inside `$(...)` or a pipeline stage exits only that subshell.
-- Exit codes: 0 success, 1 general, 2 misuse, 126 not executable, 127 not
-  found, 128+N killed by signal N (130 is Ctrl-C).
-- Always `mktemp`, never a fixed `/tmp/name`: it is a race and a
-  security hole.
-- Print errors to **stderr** and keep stdout for data, so pipelines work.
+0 is success. 1 is a general error. 2 is misuse. 126 is "found, not
+executable". 127 is "not found". 128+N means killed by signal N, so
+SIGTERM (15) is 143 and Ctrl-C (SIGINT, 2) is 130.
+
+```bash file=n14.sh
+missing-cmd >/dev/null 2>&1
+echo "missing $?"
+tmp=$(mktemp)
+printf 'echo hi\n' > "$tmp"
+chmod a-x "$tmp"
+"$tmp" >/dev/null 2>&1
+echo "not-executable $?"
+rm -f "$tmp"
+sleep 30 &
+child=$!
+kill "$child"
+wait "$child" 2>/dev/null
+echo "signal $?"
+```
+
+```text output
+missing 127
+not-executable 126
+signal 143
+```
 
 ## Exercises
 

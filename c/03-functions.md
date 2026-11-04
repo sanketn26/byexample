@@ -1,34 +1,99 @@
 # C 03 — Functions
 
-Everything is passed **by value**. To let a function modify something, pass
+Everything is passed by value. To let a function modify something, pass
 its address. There is no overloading, no default arguments, and no nested
 functions.
 
-## Example
+`int f()` means "unspecified parameters"; write `int f(void)` for none.
+Declare a function before you call it. Implicit declarations are an error
+in C99 and later. Mark file-private helpers `static`: without it they have
+external linkage and can clash with other files.
 
-```c file=example.c
-#include <stdarg.h>
-#include <stddef.h>
+## A parameter is a local copy
+
+Changing `a` inside `add` would not change the caller's variable. The
+function returns the new value instead.
+
+```c file=n01.c
 #include <stdio.h>
 
 static int add(int a, int b) {
     return a + b;
 }
 
-/* Pointer parameters let a function change the caller's variables */
+int main(void) {
+    printf("%d\n", add(2, 3));
+    return 0;
+}
+```
+
+```text output
+5
+```
+
+## A pointer parameter writes through to the caller
+
+`swap` receives addresses. Assigning to `*a` changes the object the caller
+named. Put `const` on a pointer you only read: it documents that, and the
+compiler enforces it.
+
+```c file=n02.c
+#include <stdio.h>
+
 static void swap(int *a, int *b) {
     int t = *a;
     *a = *b;
     *b = t;
 }
 
-/* Out-parameter for a second result */
+int main(void) {
+    int x = 1, y = 2;
+    swap(&x, &y);
+    printf("%d %d\n", x, y);
+    return 0;
+}
+```
+
+```text output
+2 1
+```
+
+## A second result goes through a pointer
+
+C has one return value. `divmod` returns the quotient and writes the
+remainder where the caller points.
+
+```c file=n03.c
+#include <stdio.h>
+
 static int divmod(int a, int b, int *rem) {
     *rem = a % b;
     return a / b;
 }
 
-/* An array parameter is really a pointer: pass the length separately */
+int main(void) {
+    int r;
+    int q = divmod(17, 5, &r);
+    printf("%d %d\n", q, r);
+    return 0;
+}
+```
+
+```text output
+3 2
+```
+
+## An array argument decays to a pointer
+
+`sizeof` on the caller's array is the whole object. Inside the callee the
+parameter is a pointer, so `sizeof` is the pointer width (8 here). Pass
+the length yourself. Never return the address of a local: that object
+dies when the function returns.
+
+```c file=n04.c
+#include <stddef.h>
+#include <stdio.h>
+
 static int sum_array(const int *a, size_t n) {
     int s = 0;
     for (size_t i = 0; i < n; i++) {
@@ -41,13 +106,58 @@ static size_t size_via_pointer(const int *p) {
     return sizeof p;
 }
 
-/* static local: keeps its value between calls */
+int main(void) {
+    int arr[10] = {0};
+    printf("%zu %zu\n", sizeof arr, size_via_pointer(arr));
+    int data[] = {4, 9, 1, 5};
+    printf("%d\n", sum_array(data, sizeof data / sizeof data[0]));
+    return 0;
+}
+```
+
+```text output
+40 8
+19
+```
+
+## A static local keeps its value
+
+`c` is initialized once, then lives for the rest of the program. Call
+`counter` in separate statements. Argument evaluation order is
+unspecified, so `printf("%d %d %d", counter(), counter(), counter())`
+could print `3 2 1`.
+
+```c file=n05.c
+#include <stdio.h>
+
 static int counter(void) {
     static int c = 0;
     return ++c;
 }
 
-/* Variadic: you must know the count and types yourself */
+int main(void) {
+    int c1 = counter();
+    int c2 = counter();
+    int c3 = counter();
+    printf("%d %d %d\n", c1, c2, c3);
+    return 0;
+}
+```
+
+```text output
+1 2 3
+```
+
+## You tell a variadic function the count and the types
+
+`va_arg` does not check anything. The wrong type, or reading more
+arguments than were passed, is undefined. Prefer an array or a struct in
+your own APIs.
+
+```c file=n06.c
+#include <stdarg.h>
+#include <stdio.h>
+
 static int sum_ints(int count, ...) {
     va_list ap;
     va_start(ap, count);
@@ -59,7 +169,25 @@ static int sum_ints(int count, ...) {
     return s;
 }
 
-/* Small structs can be returned by value */
+int main(void) {
+    printf("%d\n", sum_ints(4, 1, 2, 3, 4));
+    return 0;
+}
+```
+
+```text output
+10
+```
+
+## A small struct can be returned by value
+
+The return copies `lo` and `hi`. The caller does not share the local
+`struct pair`.
+
+```c file=n07.c
+#include <stddef.h>
+#include <stdio.h>
+
 struct pair {
     int lo, hi;
 };
@@ -77,74 +205,66 @@ static struct pair min_max(const int *a, size_t n) {
     return p;
 }
 
+int main(void) {
+    int data[] = {4, 9, 1, 5};
+    struct pair mm = min_max(data, 4);
+    printf("%d %d\n", mm.lo, mm.hi);
+    return 0;
+}
+```
+
+```text output
+1 9
+```
+
+## Recursion uses the call stack
+
+`fact(10)` is `10 * 9 * … * 1`. Each call waits for the one below it.
+Depth is limited by the stack; a deep recursion crashes, it does not
+return a clean error.
+
+```c file=n08.c
+#include <stdio.h>
+
 static unsigned long fact(unsigned n) {
     return n <= 1 ? 1UL : n * fact(n - 1);
 }
 
 int main(void) {
-    printf("%d\n", add(2, 3));
-
-    int x = 1, y = 2;
-    swap(&x, &y);
-    printf("%d %d\n", x, y);
-
-    int r;
-    int q = divmod(17, 5, &r);
-    printf("%d %d\n", q, r);
-
-    int arr[10] = {0};
-    printf("%zu %zu\n", sizeof arr, size_via_pointer(arr));
-
-    int data[] = {4, 9, 1, 5};
-    printf("%d\n", sum_array(data, sizeof data / sizeof data[0]));
-    struct pair mm = min_max(data, 4);
-    printf("%d %d\n", mm.lo, mm.hi);
-
-    /* Separate statements: argument evaluation order is unspecified, so
-       printf("%d %d %d", counter(), counter(), counter()) could print 3 2 1 */
-    int c1 = counter();
-    int c2 = counter();
-    int c3 = counter();
-    printf("%d %d %d\n", c1, c2, c3);
-    printf("%d\n", sum_ints(4, 1, 2, 3, 4));
     printf("%lu\n", fact(10));
     return 0;
 }
 ```
 
 ```text output
-5
-2 1
-3 2
-40 8
-19
-1 9
-1 2 3
-10
 3628800
 ```
 
-## Details that bite
+## `int f(void)` means no parameters
 
-- `int f()` in C means "unspecified parameters"; write `int f(void)` for
-  no parameters.
-- An array argument **decays** into a pointer to its first element, so
-  `sizeof` inside the callee gives the pointer size. Always pass a length.
-- Modifying a parameter changes only the local copy; modifying `*param`
-  changes the caller's object.
-- Never return a pointer to a local (automatic) variable: it dies when the
-  function returns.
-- Mark file-private helpers `static`. Without it they have external
-  linkage and can clash with other files.
-- Use `const` on pointer parameters you only read from; it documents intent
-  and lets the compiler catch mistakes.
-- `va_arg` with the wrong type, or reading more arguments than were
-  passed, is undefined behaviour. Prefer arrays or structs to variadics in
-  your own APIs.
-- Recursion depth is limited by the stack; deep recursion crashes with a
-  stack overflow rather than a clean error.
-- Declare functions before use (prototypes in headers). Implicit
-  declarations are an error in C99 and later.
+`int f()` is an old-style declaration: the parameter list is unspecified.
+`int f(void)` means the function takes nothing. Declare the function
+before the call. `static` gives it internal linkage, so another file can
+have its own `twice` without a clash.
+
+```c file=n09.c
+#include <stdio.h>
+
+static int twice(int n);
+
+int main(void) {
+    printf("%d\n", twice(21));
+    return 0;
+}
+
+static int twice(int n) {
+    return n * 2;
+}
+```
+
+```text output
+42
+```
 
 ## Exercises
 

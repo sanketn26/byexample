@@ -1,93 +1,43 @@
 # Shell 11 — Arguments, Options and Real Scripts
 
-A script is a program: it needs a usage message, option parsing, input
-validation, sensible exit codes, and a `main`. This lesson turns a bag of
-commands into a tool other people can run.
+A script is a program. It needs a usage message, option parsing, input
+validation, sensible exit codes, and a `main`. `getopts` is the POSIX
+builtin for short options. It stops at the first non-option. Reset
+`OPTIND=1` (and make it `local`) when you parse inside a function,
+then `shift $((OPTIND - 1))`.
 
-## Example
+## `getopts` reads short options
 
-```bash file=example.sh
-#!/usr/bin/env bash
+A trailing colon on an option means it takes an argument (`n:`). The
+leading colon in the spec is silent mode: you handle unknown options
+and missing arguments yourself. `getopt` without the `s` understands
+long options, but GNU and BSD disagree. A `case` loop is the portable
+long-option parser.
+
+```bash file=n01.sh
 set -euo pipefail
-
-usage() {
-  cat <<'EOF'
-usage: tool [-v] [-n COUNT] [-o FILE] [--dry-run] [--] NAME...
-  -n COUNT   repeat count (default 1)
-  -o FILE    output file (default: stdout)
-  -v         verbose
-  --dry-run  print what would happen
-EOF
-}
-
-die() { echo "tool: $*" >&2; exit 2; }
-
 main() {
-  local count=1 verbose=0 out="" dry=0
-
-  # getopts handles short options; options with ':' take an argument
+  local count=1 verbose=0
   local opt OPTIND=1
-  while getopts ":vn:o:h" opt; do
+  while getopts ":vn:" opt; do
     case $opt in
       v) verbose=1 ;;
       n) count=$OPTARG ;;
-      o) out=$OPTARG ;;
-      h) usage; return 0 ;;
-      :) die "option -$OPTARG needs an argument" ;;
-      \?) die "unknown option -$OPTARG" ;;
+      \?) echo "tool: unknown option -$OPTARG" >&2; return 2 ;;
     esac
   done
-  shift $((OPTIND - 1))                  # what is left are the operands
-
-  [[ $count =~ ^[0-9]+$ ]] || die "COUNT must be a number, got '$count'"
-  (( $# > 0 )) || die "missing NAME"
-
+  shift $((OPTIND - 1))
   local name i
   for name in "$@"; do
     for ((i = 0; i < count; i++)); do
       (( verbose )) && echo "[verbose] greeting $name ($((i + 1))/$count)" >&2
       echo "hello, $name"
     done
-  done > "${out:-/dev/stdout}"
+  done
 }
-
-# Run the same function with different command lines
 main -n 2 Ada
 echo "--- verbose, two names"
-main -v Ada Linus 2>&1
-echo "--- errors"
-( main -n abc Ada ) 2>&1 || echo "exit: $?"
-( main ) 2>&1 || echo "exit: $?"
-( main -z Ada ) 2>&1 || echo "exit: $?"
-( main -n ) 2>&1 || echo "exit: $?"
-
-# Hand-rolled loop for long options (getopts has none)
-parse_long() {
-  local dry=0 files=()
-  while (( $# )); do
-    case $1 in
-      --dry-run)  dry=1 ;;
-      --name=*)   files+=("${1#*=}") ;;
-      --name)     files+=("$2"); shift ;;
-      --)         shift; files+=("$@"); break ;;
-      -*)         die "unknown option $1" ;;
-      *)          files+=("$1") ;;
-    esac
-    shift
-  done
-  echo "dry=$dry files=${files[*]}"
-}
-parse_long --dry-run --name=a --name b -- -c d
-
-# Environment as configuration, with defaults and a documented override
-: "${TOOL_COLOR:=never}"
-echo "color: $TOOL_COLOR"
-TOOL_COLOR=always bash -c 'echo "child: ${TOOL_COLOR:-unset}"'
-
-# Script location and arguments
-script_dir() { cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd; }
-[[ -d $(script_dir) ]] && echo "script dir resolved"
-echo "args: $# ; name: $(basename "$0")"
+main -v Ada Linus
 ```
 
 ```text output
@@ -98,6 +48,45 @@ hello, Ada
 hello, Ada
 [verbose] greeting Linus (1/1)
 hello, Linus
+```
+
+## Usage is stdout; a usage error is stderr
+
+`-h` is the output the user asked for, so it goes to stdout and exits
+0. A bad option, a missing option argument, a bad value, or a missing
+operand goes to stderr and exits 2. Document the codes: 0 ok, 1
+runtime failure, 2 usage error.
+
+```bash file=n02.sh
+set -euo pipefail
+usage() { echo "usage: tool [-v] [-n COUNT] [-o FILE] [--] NAME..."; }
+die() { echo "tool: $*" >&2; exit 2; }
+main() {
+  local count=1 opt OPTIND=1
+  while getopts ":vn:h" opt; do
+    case $opt in
+      v) ;;
+      n) count=$OPTARG ;;
+      h) usage; return 0 ;;
+      :) die "option -$OPTARG needs an argument" ;;
+      \?) die "unknown option -$OPTARG" ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  [[ $count =~ ^[0-9]+$ ]] || die "COUNT must be a number, got '$count'"
+  (( $# > 0 )) || die "missing NAME"
+  echo "ok $count $*"
+}
+main -h
+echo "--- errors"
+( main -n abc Ada ) 2>&1 || echo "exit: $?"
+( main ) 2>&1 || echo "exit: $?"
+( main -z Ada ) 2>&1 || echo "exit: $?"
+( main -n ) 2>&1 || echo "exit: $?"
+```
+
+```text output
+usage: tool [-v] [-n COUNT] [-o FILE] [--] NAME...
 --- errors
 tool: COUNT must be a number, got 'abc'
 exit: 2
@@ -107,32 +96,103 @@ tool: unknown option -z
 exit: 2
 tool: option -n needs an argument
 exit: 2
-dry=1 files=a b -c d
-color: never
-child: always
-script dir resolved
-args: 0 ; name: example.sh
 ```
 
-## Details that bite
+## Long options are a `case` loop
 
-- `getopts` is a POSIX builtin: short options only, stops at the first
-  non-option, and sets `OPTIND`. Always `shift $((OPTIND - 1))`. Reset
-  `OPTIND=1` (and make it `local`) when parsing inside a function.
-- The leading `:` in `":vn:o:h"` switches to *silent* mode, where *you*
-  handle `\?` (unknown) and `:` (missing argument).
-- `getopt` (no `s`) supports long options but differs between GNU and BSD.
-  Hand-rolled `case` loops, as above, are the portable answer.
-- Support `--` so a file named `-x` can be passed: `tool -- -x`.
-- Print usage to **stdout** for `-h` (it is the requested output, exit 0)
-  and to **stderr** for errors (exit 2).
-- `$0` is how the script was invoked; `${BASH_SOURCE[0]}` is the file even
-  when the script is `source`d. Never assume the current directory is the
-  script's directory.
-- Pick exit codes on purpose and document them: 0 ok, 1 runtime failure,
-  2 usage error, plus any domain-specific ones.
-- Do not `eval` user input, and do not build commands as strings. Keep
-  arguments in arrays and run `"${cmd[@]}"`.
+`--name=value` and `--name value` are both worth accepting. A bare
+`--` ends the options, so a file named `-x` can be an operand:
+`tool -- -x`.
+
+```bash file=n03.sh
+set -euo pipefail
+die() { echo "tool: $*" >&2; exit 2; }
+parse_long() {
+  local dry=0 files=()
+  while (( $# )); do
+    case $1 in
+      --dry-run) dry=1 ;;
+      --name=*)  files+=("${1#*=}") ;;
+      --name)    files+=("$2"); shift ;;
+      --)        shift; files+=("$@"); break ;;
+      -*)        die "unknown option $1" ;;
+      *)         files+=("$1") ;;
+    esac
+    shift
+  done
+  echo "dry=$dry files=${files[*]}"
+}
+parse_long --dry-run --name=a --name b -- -c d
+```
+
+```text output
+dry=1 files=a b -c d
+```
+
+## The environment is configuration
+
+`${TOOL_COLOR:=never}` sets a default without overriding a value the
+caller already exported. The child sees the exported value, not your
+default.
+
+```bash file=n04.sh
+: "${TOOL_COLOR:=never}"
+echo "color: $TOOL_COLOR"
+TOOL_COLOR=always bash -c 'echo "child: ${TOOL_COLOR:-unset}"'
+```
+
+```text output
+color: never
+child: always
+```
+
+## `$0` is how you were started
+
+`${BASH_SOURCE[0]}` is this file, even when the file is sourced.
+Never assume the current directory is the script's directory. `cd`
+to `dirname` of `BASH_SOURCE` and `pwd` if you need that directory.
+
+```bash file=n05.sh
+tmp=$(mktemp -d)
+cat > "$tmp/lib.sh" << 'EOF'
+echo "dollar0=$(basename "$0")"
+echo "source=$(basename "${BASH_SOURCE[0]}")"
+EOF
+echo "executed:"
+bash "$tmp/lib.sh"
+echo "sourced:"
+source "$tmp/lib.sh"
+script_dir() { cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd; }
+[[ -d $(script_dir) ]] && echo "script dir resolved"
+echo "name: $(basename "$0")"
+```
+
+```text output
+executed:
+dollar0=lib.sh
+source=lib.sh
+sourced:
+dollar0=n05.sh
+source=lib.sh
+script dir resolved
+name: n05.sh
+```
+
+## Keep commands in arrays, never in `eval`
+
+Do not build a command as a string, and do not `eval` user input.
+`"$@"` and `"${cmd[@]}"` pass each argument through intact, spaces
+included.
+
+```bash file=n06.sh
+cmd=(printf '<%s>' 'a b' c)
+"${cmd[@]}"
+echo
+```
+
+```text output
+<a b><c>
+```
 
 ## Exercises
 

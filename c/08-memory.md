@@ -1,17 +1,154 @@
 # C 08 — Memory Management
 
 You allocate, you free. Every `malloc` needs exactly one `free`, on every
-path. The compiler will not help; the sanitizers will.
+path. The compiler will not help; AddressSanitizer and Valgrind will.
 
-## Example
+A leak is a pointer lost before `free`. A double free frees twice. A
+use-after-free touches memory after `free`. An overflow writes past the
+end. All four are undefined, and the program may appear to work.
+`free` does not have to return the pages to the OS immediately. A leak
+report at exit is a bug, not noise.
 
-```c file=example.c
-#include <stddef.h>
+Decide, for each function, who owns a pointer, and say so. Do not `free`
+a stack address, a string literal, or a pointer into the middle of a
+block. Never return the address of a local variable.
+
+## malloc does not initialize
+
+`sizeof *p` stays correct if the type of `p` changes. Check for `NULL`.
+The block is uninitialized until you write it.
+
+```c file=n01.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *p = malloc(3 * sizeof *p);
+    if (!p) {
+        return 1;
+    }
+    p[0] = 1;
+    p[1] = 2;
+    p[2] = 3;
+    printf("%d\n", p[0] + p[1] + p[2]);
+    free(p);
+    return 0;
+}
+```
+
+```text output
+6
+```
+
+## realloc may move; save the old pointer
+
+On failure `realloc` returns `NULL` and the old block is still yours.
+`p = realloc(p, n)` drops that pointer. After a successful `free`, set
+the variable to `NULL`: `free(NULL)` is defined, and a null pointer
+crashes instead of silently corrupting. Every old pointer into a block
+is invalid once `realloc` has moved it.
+
+```c file=n02.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *p = malloc(3 * sizeof *p);
+    if (!p) {
+        return 1;
+    }
+    int *tmp = realloc(p, 6 * sizeof *p);
+    if (!tmp) {
+        free(p);
+        return 1;
+    }
+    p = tmp;
+    for (int i = 3; i < 6; i++) {
+        p[i] = i;
+    }
+    printf("6 elems last=%d\n", p[5]);
+    free(p);
+    p = NULL;
+    free(p);
+    return 0;
+}
+```
+
+```text output
+6 elems last=5
+```
+
+## calloc zeroes and checks the product
+
+`malloc(n * sizeof *p)` with an untrusted `n` can wrap the multiplication
+and allocate a short block. `calloc` rejects that overflow and fills the
+block with zero bytes.
+
+```c file=n03.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *z = calloc(4, sizeof *z);
+    if (!z) {
+        return 1;
+    }
+    printf("%d\n", z[0] + z[3]);
+    free(z);
+    return 0;
+}
+```
+
+```text output
+0
+```
+
+## The caller owns the copy
+
+`dup_string` allocates `strlen + 1` and copies the bytes. The caller
+frees it. Changing the copy does not change the literal.
+
+```c file=n04.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* An owned, growable string buffer: create / use / destroy */
+static char *dup_string(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) {
+        memcpy(p, s, n);
+    }
+    return p;
+}
+
+int main(void) {
+    char *copy = dup_string("owned");
+    if (!copy) {
+        return 1;
+    }
+    copy[0] = 'O';
+    printf("%s\n", copy);
+    free(copy);
+    return 0;
+}
+```
+
+```text output
+Owned
+```
+
+## One buffer owns its heap bytes
+
+Growth goes through a temporary, same as `realloc` above. `sb_free`
+releases the data and zeroes the struct so a second free would be
+`free(NULL)`.
+
+```c file=n05.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 struct strbuf {
     char *data;
     size_t len, cap;
@@ -24,7 +161,7 @@ static int sb_append(struct strbuf *sb, const char *s) {
         while (ncap < sb->len + n + 1) {
             ncap *= 2;
         }
-        char *p = realloc(sb->data, ncap); /* temp: keep the old on failure */
+        char *p = realloc(sb->data, ncap);
         if (!p) {
             return -1;
         }
@@ -41,7 +178,31 @@ static void sb_free(struct strbuf *sb) {
     *sb = (struct strbuf){0};
 }
 
-/* Singly linked list: each node owns itself, the list owns the nodes */
+int main(void) {
+    struct strbuf sb = {0};
+    if (sb_append(&sb, "foo") != 0 || sb_append(&sb, "bar") != 0) {
+        return 1;
+    }
+    printf("%s %zu\n", sb.data, sb.len);
+    sb_free(&sb);
+    return 0;
+}
+```
+
+```text output
+foobar 6
+```
+
+## Free the node only after you have saved next
+
+The link lives in the node. Read `next`, then `free`. Losing `next`
+first is a leak of the rest of the list, or a use-after-free if you
+follow it anyway.
+
+```c file=n06.c
+#include <stdio.h>
+#include <stdlib.h>
+
 struct node {
     int value;
     struct node *next;
@@ -59,13 +220,39 @@ static struct node *push_front(struct node *head, int v) {
 
 static void list_free(struct node *head) {
     while (head) {
-        struct node *next = head->next; /* read before freeing */
+        struct node *next = head->next;
         free(head);
         head = next;
     }
 }
 
-/* A bump ("arena") allocator: many allocations, one free */
+int main(void) {
+    struct node *head = NULL;
+    for (int i = 3; i >= 1; i--) {
+        head = push_front(head, i);
+    }
+    for (struct node *n = head; n; n = n->next) {
+        printf("%d ", n->value);
+    }
+    printf("\n");
+    list_free(head);
+    return 0;
+}
+```
+
+```text output
+1 2 3 
+```
+
+## An arena frees many allocations at once
+
+Bump the cursor, aligned, and hand out pointers into one array. Nothing
+is freed individually. `align` must be a power of two. The second block
+starts at offset 8, and 4 more bytes make `used` 12.
+
+```c file=n07.c
+#include <stdio.h>
+
 struct arena {
     unsigned char *base;
     size_t cap, used;
@@ -80,106 +267,42 @@ static void *arena_alloc(struct arena *a, size_t size, size_t align) {
     return a->base + off;
 }
 
-static char *dup_string(const char *s) {
-    size_t n = strlen(s) + 1;
-    char *p = malloc(n);
-    if (p) {
-        memcpy(p, s, n);
-    }
-    return p;
-}
-
 int main(void) {
-    /* malloc: sizeof *p keeps the size correct if the type changes */
-    int *p = malloc(3 * sizeof *p);
-    if (!p) {
-        return 1;
-    }
-    p[0] = 1;
-    p[1] = 2;
-    p[2] = 3;
-    printf("%d\n", p[0] + p[1] + p[2]);
-
-    int *tmp = realloc(p, 6 * sizeof *p);
-    if (!tmp) {
-        free(p);
-        return 1;
-    }
-    p = tmp;
-    for (int i = 3; i < 6; i++) {
-        p[i] = i;
-    }
-    printf("6 elems last=%d\n", p[5]);
-    free(p);
-    p = NULL; /* free(NULL) is harmless; a dangling pointer is not */
-
-    int *z = calloc(4, sizeof *z); /* zeroed, and checks n * size overflow */
-    printf("%d\n", z[0] + z[3]);
-    free(z);
-
-    char *copy = dup_string("owned");
-    copy[0] = 'O';
-    printf("%s\n", copy);
-    free(copy);
-
-    struct strbuf sb = {0};
-    sb_append(&sb, "foo");
-    sb_append(&sb, "bar");
-    printf("%s %zu\n", sb.data, sb.len);
-    sb_free(&sb);
-
-    struct node *head = NULL;
-    for (int i = 3; i >= 1; i--) {
-        head = push_front(head, i);
-    }
-    for (struct node *n = head; n; n = n->next) {
-        printf("%d ", n->value);
-    }
-    printf("\n");
-    list_free(head);
-
     unsigned char storage[64];
     struct arena a = {storage, sizeof storage, 0};
     unsigned char *p1 = arena_alloc(&a, 5, 1);
     unsigned char *p2 = arena_alloc(&a, 4, 8);
+    if (!p1 || !p2) {
+        return 1;
+    }
     printf("%td %td used=%zu\n", p1 - storage, p2 - storage, a.used);
+    return 0;
+}
+```
 
+```text output
+0 8 used=12
+```
+
+## Every type has an alignment
+
+`_Alignof(double)` is 8 here, and `_Alignof(char)` is 1. An address that
+is not a multiple of the alignment is not a valid pointer to that type.
+The arena above rounds up so the second block is aligned for a wider type.
+
+```c file=n08.c
+#include <stdio.h>
+
+int main(void) {
     printf("%zu %zu\n", _Alignof(double), _Alignof(char));
     return 0;
 }
 ```
 
 ```text output
-6
-6 elems last=5
-0
-Owned
-foobar 6
-1 2 3 
-0 8 used=12
 8 1
 ```
 
-## Details that bite
-
-- **Leak**: lost the pointer before `free`. **Double free**: freed twice.
-  **Use after free**: touched memory after `free`. **Overflow**: wrote past
-  the end. All of these are undefined behaviour and the program may
-  appear to work. Run under `-fsanitize=address` (or Valgrind) always.
-- `malloc` returns uninitialised memory. `calloc` zeroes and guards
-  `count * size` overflow. Writing `malloc(n * sizeof x)` with untrusted
-  `n` is an integer-overflow vulnerability.
-- Always handle `NULL` from allocation. Decide, per function, who owns a
-  returned or passed pointer and write it in the comment.
-- `realloc(p, n)` may move the block: every old pointer into it is
-  invalid afterwards. Never write `p = realloc(p, n)` (leaks on failure).
-- Do not `free` pointers to the stack, to string literals, or into the
-  middle of an allocation.
-- Never return the address of a local variable.
-- After `free(p)`, set `p = NULL` where the variable lives on; it turns
-  silent corruption into a visible crash.
-- `free` does not give memory back to the OS immediately, and `valgrind`
-  or ASan leak reports at exit are your friend, not noise.
 
 ## Exercises
 

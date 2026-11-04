@@ -1,30 +1,47 @@
 # Rust 11 — Concurrency
 
-Rust's ownership rules extend to threads: the compiler rejects data races at
-compile time ("fearless concurrency"). The `Send` and `Sync` marker traits
-say what may cross threads; you mostly just see them in error messages.
+Ownership extends to threads. The compiler rejects a data race. `Send` and
+`Sync` are the marker traits that say what may cross a thread; you mostly
+see them in an error message. Rust does not prevent deadlocks or logic
+races. `Rc` and `RefCell` are not `Send` or `Sync`. Use `Arc` and
+`Mutex` or `RwLock`. These are OS threads. Many small I/O tasks want `async`
+with an executor such as `tokio`. Data parallelism wants `rayon`.
 
-## Example
+## `spawn` returns the closure's value through `join`
 
-```rust file=example.rs
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+`thread::spawn` requires a `'static` closure, so a borrowed local will not
+compile. `move` the owned values in. `join` waits, and the `Result` is `Err`
+if the thread panicked.
+
+```rust file=n01.rs
 use std::thread;
-use std::time::Duration;
 
 fn main() {
-    // spawn + join returns the closure's value
     let handles: Vec<_> = (0..4).map(|i| thread::spawn(move || i * 10)).collect();
     let results: Vec<i32> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     println!("{results:?}");
+}
+```
 
-    // Scoped threads may borrow local data, because they must finish first
+```text output
+[0, 10, 20, 30]
+```
+
+## `scope` may borrow locals
+
+The threads in `thread::scope` finish before `scope` returns, so they may
+borrow data on the stack. Each iteration hands out a disjoint `&mut`. The
+second scope only reads `words`, which is a shared borrow.
+
+```rust file=n02.rs
+use std::thread;
+
+fn main() {
     let mut data = vec![0usize; 5];
     thread::scope(|s| {
         for (i, slot) in data.iter_mut().enumerate() {
             s.spawn(move || {
-                *slot = i * i; // each thread owns a disjoint &mut
+                *slot = i * i;
             });
         }
     });
@@ -36,8 +53,27 @@ fn main() {
         h.join().unwrap()
     });
     println!("{total}");
+}
+```
 
-    // Message passing: many producers, one consumer
+```text output
+[0, 1, 4, 9, 16]
+6
+```
+
+## A channel ends when every sender is dropped
+
+`drop(tx)` matters. The original sender is still alive after the clones, and
+`rx.iter()` waits until all of them are gone. Forgetting the drop hangs.
+The receive order is not the send order. Sort when you need a stable line.
+A `MutexGuard` unlocks when it goes out of scope. Do not hold it across a
+blocking call.
+
+```rust file=n03.rs
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
     let (tx, rx) = mpsc::channel();
     for id in 0..3 {
         let tx = tx.clone();
@@ -47,12 +83,27 @@ fn main() {
             }
         });
     }
-    drop(tx); // the iterator below ends when every sender is gone
+    drop(tx);
     let mut got: Vec<i32> = rx.iter().collect();
     got.sort();
     println!("{got:?}");
+}
+```
 
-    // Shared state: Arc for shared ownership, Mutex for exclusive access
+```text output
+[0, 1, 10, 11, 20, 21]
+```
+
+## `Arc<Mutex<_>>` shares a counter
+
+`Arc` is the shared owner. `Mutex` is the exclusive access. Eight threads
+each add 1000, so the counter ends at 8000 no matter how they interleave.
+
+```rust file=n04.rs
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
     let counter = Arc::new(Mutex::new(0));
     let workers: Vec<_> = (0..8)
         .map(|_| {
@@ -68,8 +119,52 @@ fn main() {
         w.join().unwrap();
     }
     println!("{}", *counter.lock().unwrap());
+}
+```
 
-    // Atomics for simple counters and flags
+```text output
+8000
+```
+
+## A panic while holding the lock poisons it
+
+The next `lock()` returns `Err`. `unwrap()` would panic again. `into_inner`
+on that error recovers the data. The hook hides the panic text. The panic
+stays in the thread that raised it. `join` is how the parent hears about it.
+
+```rust file=n05.rs
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    std::panic::set_hook(Box::new(|_| {}));
+    let m = Arc::new(Mutex::new(1));
+    let c = Arc::clone(&m);
+    let joined = thread::spawn(move || {
+        let _g = c.lock().unwrap();
+        panic!("boom");
+    })
+    .join();
+    println!("{} {}", joined.is_err(), m.lock().unwrap_err().into_inner());
+}
+```
+
+```text output
+true 1
+```
+
+## Atomics count without a lock
+
+`Ordering::Relaxed` is enough for a counter that nothing else depends on.
+Use `SeqCst`, or Acquire and Release, when one atomic has to be ordered
+against another variable.
+
+```rust file=n06.rs
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+fn main() {
     let hits = Arc::new(AtomicUsize::new(0));
     let workers: Vec<_> = (0..8)
         .map(|_| {
@@ -85,8 +180,23 @@ fn main() {
         w.join().unwrap();
     }
     println!("{}", hits.load(Ordering::SeqCst));
+}
+```
 
-    // RwLock: many readers or one writer
+```text output
+8000
+```
+
+## `RwLock` allows many readers or one writer
+
+Two `read` guards may overlap. A `write` guard waits until they are dropped.
+The reads here finish before the write, because the guards live in the inner
+block.
+
+```rust file=n07.rs
+use std::sync::{Arc, RwLock};
+
+fn main() {
     let cfg = Arc::new(RwLock::new(String::from("v1")));
     {
         let r1 = cfg.read().unwrap();
@@ -95,8 +205,26 @@ fn main() {
     }
     *cfg.write().unwrap() = "v2".to_string();
     println!("{}", cfg.read().unwrap());
+}
+```
 
-    // A small worker pool: jobs in, results out
+```text output
+v1 v1
+v2
+```
+
+## A pool is a channel of jobs and a channel of results
+
+Each worker locks the receiver, takes one job, and sends the square back.
+Closing the job channel is the shutdown signal: `recv` returns `Err` and the
+worker breaks. The squares can arrive in any order, so sort them.
+
+```rust file=n08.rs
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
     let (job_tx, job_rx) = mpsc::channel::<u32>();
     let job_rx = Arc::new(Mutex::new(job_rx));
     let (res_tx, res_rx) = mpsc::channel();
@@ -108,7 +236,7 @@ fn main() {
                 let job = rx.lock().unwrap().recv();
                 match job {
                     Ok(n) => tx.send(n * n).unwrap(),
-                    Err(_) => break, // channel closed: no more work
+                    Err(_) => break,
                 }
             })
         })
@@ -124,17 +252,26 @@ fn main() {
     for w in pool {
         w.join().unwrap();
     }
+}
+```
 
-    // A panic stays inside its thread and shows up in join()
-    let r = thread::spawn(|| {
-        panic!("boom");
-    })
-    .join();
-    println!("{}", r.is_err());
+```text output
+[1, 4, 9, 16, 25, 36]
+```
 
-    // Timeouts
-    let (_keep_alive, rx2) = mpsc::channel::<i32>();
-    match rx2.recv_timeout(Duration::from_millis(20)) {
+## `recv_timeout` fails when nobody sends
+
+The sender is kept alive and unused, so the channel stays open and the wait
+ends as a timeout rather than as a disconnect. The port number of a socket
+changes every run. A duration you chose does not.
+
+```rust file=n09.rs
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn main() {
+    let (_keep_alive, rx) = mpsc::channel::<i32>();
+    match rx.recv_timeout(Duration::from_millis(20)) {
         Err(mpsc::RecvTimeoutError::Timeout) => println!("timeout"),
         other => println!("{other:?}"),
     }
@@ -142,38 +279,8 @@ fn main() {
 ```
 
 ```text output
-[0, 10, 20, 30]
-[0, 1, 4, 9, 16]
-6
-[0, 1, 10, 11, 20, 21]
-8000
-8000
-v1 v1
-v2
-[1, 4, 9, 16, 25, 36]
-true
 timeout
 ```
-
-## Details that bite
-
-- `thread::spawn` requires `'static` closures, so borrowed locals do not
-  work: `move` ownership in, or use `thread::scope`.
-- `Rc` and `RefCell` are not `Send`/`Sync`; use `Arc` and `Mutex`/`RwLock`.
-  The compiler tells you exactly which type is the problem.
-- A `MutexGuard` is released when it goes out of scope. Holding it across
-  a blocking call or `.await` serialises everything.
-- A thread that panics while holding a lock *poisons* it; later
-  `lock()` returns `Err`. `unwrap()` propagates the panic; use
-  `into_inner()` on the error to recover the data.
-- Deadlock is still possible (lock ordering, a channel that never
-  closes). Rust prevents data races, not deadlocks or logic races.
-- Channels close when all `Sender`s are dropped: forgetting to `drop(tx)`
-  makes `rx.iter()` hang forever.
-- `Ordering::Relaxed` is enough for independent counters; use
-  `SeqCst` (or Acquire/Release) when ordering between variables matters.
-- Threads are OS threads. For large numbers of I/O tasks use `async`
-  (with an executor such as `tokio`); for data parallelism use `rayon`.
 
 ## Exercises
 

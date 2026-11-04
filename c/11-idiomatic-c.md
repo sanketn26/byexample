@@ -1,22 +1,44 @@
 # C 11 — Idiomatic C
 
-Idiomatic C is *defensive and explicit*: make illegal states hard to
-express, make ownership obvious, make the compiler and sanitizers do the
-checking, and keep the surface area small. Good C reads like a contract.
+Idiomatic C is defensive and explicit: make illegal states hard to
+express, make ownership obvious, and keep the surface small. Communities
+disagree on the details (kernel, embedded, POSIX, games). Follow the
+project's style guide first. The common core is below.
 
-## Example
+Build with `-std=c11 -Wall -Wextra -Wpedantic -Werror`, and with
+`-fsanitize=address,undefined` in development and CI. Do not silence a
+warning with a cast. Undefined behaviour is not an error you will see; it
+is a contract the optimiser assumes you kept. Sanitizers and analysers
+(`clang-tidy`, `cppcheck`, `gcc -fanalyzer`) are the detectors.
 
-```c file=example.c
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+Use `size_t` for sizes and indexes, `bool` from `<stdbool.h>`, and
+`uint8_t` and the rest from `<stdint.h>`. Initialize at the declaration,
+and zero a struct with `= {0}`. Put `const` on every pointer you only
+read, and `static` on file-private functions and data. Prefer `snprintf`
+and `memcpy` with a length to `strcpy`, `strcat`, `sprintf`, and `gets`.
+Prefer an enum to a `#define` integer constant. Document ownership
+("caller frees", "borrowed"). Hide a struct in the `.c` file when callers
+must not touch the fields. Headers get an include guard and the minimum
+includes, and they do not define variables. Return a status and write the
+result through a pointer when the obvious error value, such as `-1`, can
+also be a real result. One `goto cleanup` beats a copy of the same
+`free`s in every branch. Keep functions short and at one level of
+abstraction: a 300-line function with six labels is a smell. `main`
+should parse arguments and call something you can test.
+
+## One list expands into the enum and the names
+
+An X-macro is the exception to "prefer a function": the list has to be
+text, because it is generated twice. The name table is indexed by the
+enum. Anything outside the range is rejected, not read off the end.
+A `switch` on an enum with no `default` lets `-Wswitch` tell you when a
+new enumerator is unhandled. That is the same idea as this bounds check.
+
+```c file=n01.c
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-/* 1. X-macros: one list, many expansions (enum, names, tables) */
 #define COLORS(X) \
-    X(RED, "red")   \
+    X(RED, "red") \
     X(GREEN, "green") \
     X(BLUE, "blue")
 
@@ -33,25 +55,110 @@ static const char *color_name(enum color c) {
         COLORS(X)
 #undef X
     };
-    return (unsigned)c < COLOR_COUNT ? names[c] : "invalid"; /* bounds check */
+    return (unsigned)c < COLOR_COUNT ? names[c] : "invalid";
 }
 
-/* 2. Compile-time assertions document and enforce assumptions */
+int main(void) {
+    printf("%s %s %s\n", color_name(COLOR_RED), color_name(COLOR_BLUE),
+           color_name((enum color)9));
+    return 0;
+}
+```
+
+```text output
+red blue invalid
+```
+
+## A function evaluates its argument once
+
+A function-like macro substitutes text. Parenthesize every argument and
+the whole expression, and if the macro is several statements, wrap it in
+`do { ... } while (0)`. It still evaluates each argument every time that
+argument appears. A `static inline` function evaluates once and keeps the
+type. Use the macro only when you must, as with the X-macro above.
+
+```c file=n02.c
+#include <stdio.h>
+
+static inline int square(int x) { return x * x; }
+
+int main(void) {
+    int n = 4;
+    printf("%d\n", square(n));
+    return 0;
+}
+```
+
+```text output
+16
+```
+
+## _Static_assert runs at compile time
+
+The program does not print the assertion. If `COLOR_COUNT` were not 3,
+or `int32_t` were not 4 bytes, this file would not build. That is the
+point: the assumption is next to the code, and it fails closed.
+
+```c file=n03.c
+#include <stdint.h>
+#include <stdio.h>
+
+enum { COLOR_COUNT = 3 };
+
 _Static_assert(COLOR_COUNT == 3, "update the docs when adding a colour");
 _Static_assert(sizeof(int32_t) == 4, "int32_t must be 4 bytes");
 
-/* 3. Options structs + designated initialisers: no 7-argument functions */
+int main(void) {
+    printf("%d %zu\n", COLOR_COUNT, sizeof(int32_t));
+    return 0;
+}
+```
+
+```text output
+3 4
+```
+
+## An options struct replaces a long parameter list
+
+Designated initializers set what you care about and zero the rest, so
+`verbose` is false without being named. The callee takes `const` because
+it only reads. Adding a field later does not break every call site.
+
+```c file=n04.c
+#include <stdbool.h>
+#include <stdio.h>
+
 struct options {
     const char *name;
     int retries;
     bool verbose;
 };
 
-static void show(const struct options *o) { /* const: read-only */
+static void show(const struct options *o) {
     printf("%s %d %d\n", o->name, o->retries, o->verbose);
 }
 
-/* 4. restrict promises the compiler the pointers do not alias */
+int main(void) {
+    struct options o = {.name = "job", .retries = 3};
+    show(&o);
+    return 0;
+}
+```
+
+```text output
+job 3 0
+```
+
+## restrict promises the pointers do not alias
+
+The compiler may then keep values in registers across the loop. You are
+promising that `out`, `a`, and `b` do not overlap. Breaking the promise
+is undefined.
+
+```c file=n05.c
+#include <stddef.h>
+#include <stdio.h>
+
 static void add_arrays(size_t n, int *restrict out, const int *restrict a,
                        const int *restrict b) {
     for (size_t i = 0; i < n; i++) {
@@ -59,8 +166,32 @@ static void add_arrays(size_t n, int *restrict out, const int *restrict a,
     }
 }
 
-/* 5. Constructor / destructor pair around an encapsulated type.
-      The destroy function takes ptr-to-ptr so it can NULL the caller's. */
+int main(void) {
+    int a[] = {1, 2, 3}, b[] = {10, 20, 30}, out[3];
+    add_arrays(3, out, a, b);
+    printf("%d %d %d\n", out[0], out[1], out[2]);
+    return 0;
+}
+```
+
+```text output
+11 22 33
+```
+
+## create and destroy own the object
+
+`calloc` zeroes, and `sizeof *r` tracks the type. Capacity zero is
+rejected. `ring_destroy` takes `ring **` so it can set the caller's
+pointer to `NULL`, and it is safe on a null pointer. The struct can stay
+opaque in a header (`typedef struct ring ring;`) while the body lives
+here. The caller frees by calling destroy, not by freeing the fields.
+
+```c file=n06.c
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 typedef struct ring ring;
 struct ring {
     int *buf;
@@ -113,16 +244,9 @@ static void ring_destroy(ring **r) {
 }
 
 int main(void) {
-    printf("%s %s %s\n", color_name(COLOR_RED), color_name(COLOR_BLUE),
-           color_name((enum color)9));
-
-    struct options o = {.name = "job", .retries = 3}; /* the rest is zero */
-    show(&o);
-
-    int a[] = {1, 2, 3}, b[] = {10, 20, 30}, out[3];
-    add_arrays(3, out, a, b);
-    printf("%d %d %d\n", out[0], out[1], out[2]);
-
+    if (ring_create(0) != NULL) {
+        return 1;
+    }
     ring *r = ring_create(3);
     if (!r) {
         return 1;
@@ -130,8 +254,8 @@ int main(void) {
     for (int i = 1; i <= 3; i++) {
         ring_push(r, i);
     }
-    int v;
-    bool pushed = ring_push(r, 4); /* full */
+    int v = 0;
+    bool pushed = ring_push(r, 4);
     ring_pop(r, &v);
     printf("push4=%d pop=%d\n", pushed, v);
     ring_push(r, 4);
@@ -141,59 +265,89 @@ int main(void) {
     printf("\n");
     ring_destroy(&r);
     printf("destroyed=%d\n", r == NULL);
+    ring_destroy(&r);
     return 0;
 }
 ```
 
 ```text output
-red blue invalid
-job 3 0
-11 22 33
 push4=0 pop=1
 2 3 4 
 destroyed=1
 ```
 
-## The checklist
+## A header guard includes the file once
 
-| Do | Avoid |
-|----|-------|
-| `-std=c11 -Wall -Wextra -Wpedantic -Werror` always | silencing warnings with casts |
-| `-fsanitize=address,undefined` in dev and CI | "it works on my machine" |
-| `size_t` for sizes and indexes | `int` indexes into big arrays |
-| `sizeof *p` in `malloc(n * sizeof *p)` | `malloc(n * sizeof(int))` repeated |
-| `const` on every pointer you only read | mutable-by-default parameters |
-| `static` for file-private functions and data | accidental external linkage |
-| `snprintf`, `memcpy` with explicit lengths | `strcpy`, `strcat`, `sprintf`, `gets` |
-| Init at declaration, `= {0}` for structs | reading uninitialised locals |
-| One exit via `goto cleanup` when owning resources | duplicated cleanup in every branch |
-| Opaque types + `_create` / `_destroy` pairs | public structs with invariants |
-| `enum` + `switch` without `default` (so `-Wswitch` warns) | `#define` integer constants |
-| `bool` from `<stdbool.h>`, `uint8_t` etc. from `<stdint.h>` | `int` flags, `unsigned char` mystery |
-| Designated initialisers and compound literals | positional init of big structs |
-| Header guards (`#ifndef FOO_H`) and minimal includes | defining variables in headers |
-| Document ownership: "caller frees", "borrowed" | ambiguous returned pointers |
-| `static inline` functions | function-like macros with side effects |
+`#ifndef` / `#define` / `#endif` make a second `#include` of the same
+header a no-op. Without the guard, two includes of a file that defines
+an object are a redefinition error. Do not put a non-`static` variable
+definition in a header: every file that includes it would export that
+symbol.
 
-## Details that bite
+```c file=guard.h
+#ifndef GUARD_H
+#define GUARD_H
+static const int guarded = 7;
+#endif
+```
 
-- Idioms vary by community (kernel, embedded, POSIX, game dev). The common
-  core is above; follow your project's style guide first.
-- Undefined behaviour is not an error you will see: it is a contract the
-  optimiser assumes you kept. Sanitizers and static analysers
-  (`clang-tidy`, `cppcheck`, `gcc -fanalyzer`) are your only reliable
-  detectors.
-- Prefer returning a status and writing results through a pointer over
-  encoding errors in the result (`-1` that can be a valid value).
-- Hide the struct body in the `.c` file whenever callers have no business
-  touching the fields; it lets you change the layout without breaking
-  anyone.
-- Macros: parenthesise arguments and the whole expression, evaluate each
-  argument once, wrap multi-statement macros in `do { … } while (0)`, and
-  prefer `static inline` functions when types are known.
-- Keep functions short with one level of abstraction. A 300-line function
-  with six `goto`s is not idiomatic; it is a code smell with a label.
-- `main` should mostly parse arguments and call into testable functions.
+```c file=n07.c
+#include "guard.h"
+#include "guard.h"
+#include <stdio.h>
+
+int main(void) {
+    printf("%d\n", guarded);
+    return 0;
+}
+```
+
+```text output
+7
+```
+
+## `snprintf` writes a number into a buffer
+
+The size argument includes the terminating `'\0'`. Check the return
+when the buffer might be too small; here 16 bytes is enough for `42`.
+
+```c file=n08.c
+#include <stdio.h>
+
+int main(void) {
+    char buf[16];
+    snprintf(buf, sizeof buf, "%d", 42);
+    printf("%s\n", buf);
+    return 0;
+}
+```
+
+```text output
+42
+```
+
+## `getenv` returns NULL when the name is unset
+
+`setenv` puts a value in the process environment. A missing name is
+`NULL`, so the caller picks the default. Do not free the pointer
+`getenv` returns.
+
+```c file=n09.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    setenv("APP_PORT", "8080", 1);
+    const char *port = getenv("APP_PORT");
+    const char *missing = getenv("APP_MISSING");
+    printf("%s %s\n", port, missing ? missing : "80");
+    return 0;
+}
+```
+
+```text output
+8080 80
+```
 
 ## Exercises
 

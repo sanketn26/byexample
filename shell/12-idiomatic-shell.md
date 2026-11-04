@@ -1,137 +1,330 @@
 # Shell 12 — Idiomatic Shell
 
-The rules experienced shell programmers follow, with before/after pairs.
-Almost every item is a bug that only shows up on a file called
-`my notes (final).txt`.
+These are the rules that keep a script from breaking on a file called
+`my notes (final).txt`. `#!/usr/bin/env bash` and `set -euo pipefail`
+belong at the top. Know what each switch does, and when to loosen it
+(lesson 07). If a script passes about 200 lines, needs real data
+structures, or parses structured data, reach for Python or Go.
+ShellCheck flags the pattern (SC2086 is "quote this"). It cannot know
+your data. `shfmt` fixes layout. Do not `sudo` inside a script you did
+not write, and do not `curl ... | bash` anything you have not read.
 
-## Example
+## Quote every expansion
 
-```bash file=example.sh
-#!/usr/bin/env bash
+Use arrays for lists and `"$@"` to pass them on. An unquoted `$f`
+is two arguments when the value contains a space.
+
+```bash file=n01.sh
 set -euo pipefail
 export LC_ALL=C
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
-touch -- "a b.txt" "c.txt" "-weird.txt"   # -- ends options: the name starts with a dash
-
-show() { printf '%s\n' "$1: $2"; }
-
-# 1. Quote every expansion.
+touch -- "a b.txt"
 f="a b.txt"
-bad=$(ls $f 2>&1 | head -1 | cut -c1-30 || true)      # two arguments: "a" and "b.txt"
-show "unquoted" "$bad"
-show "quoted" "$(ls -- "$f")"
+bad=$(ls $f 2>&1 | head -1 | cut -c1-30 || true)
+echo "unquoted: $bad"
+echo "quoted: $(ls -- "$f")"
+```
 
-# 2. Iterate with globs and arrays, never with $(ls).
+```text output
+unquoted: ls: a: No such file or directo
+quoted: a b.txt
+```
+
+## Walk a glob, not the output of `ls`
+
+`$(ls)` splits on spaces. A glob does not. Do not parse `ls`, `ps`,
+or `df` when a machine-readable flag exists (`stat -c`, `ps -o pid=`,
+`df --output`).
+
+```bash file=n02.sh
+set -euo pipefail
+export LC_ALL=C
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+touch -- "a b.txt" "c.txt" "-weird.txt"
 count=0
 for file in ./*.txt; do count=$((count + 1)); done
-show "glob loop" "$count files"
+echo "$count files"
+```
 
-# 3. Guard against a dash-leading name with -- or ./
-rm -- ./-weird.txt && show "removed" "-weird.txt"
+```text output
+3 files
+```
 
-# 4. Build commands in arrays, not strings.
-args=(--color=never --almost-all)
-cmd=(ls "${args[@]}" -1)
-show "array command" "$("${cmd[@]}" | tr '\n' ' ')"
+## End the option list with `--`
 
-# 5. [[ ]] over [ ]; (( )) for numbers.
+A name that starts with `-` is otherwise a flag. `./"$f"` is the
+other way to say "this is a path".
+
+```bash file=n03.sh
+set -euo pipefail
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+touch -- "-weird.txt"
+rm -- ./-weird.txt
+echo "removed -weird.txt"
+```
+
+```text output
+removed -weird.txt
+```
+
+## Build the command in an array
+
+A string gets word-split and globbed when you run it. An array does
+not. Long options are just elements.
+
+```bash file=n04.sh
+set -euo pipefail
+export LC_ALL=C
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+touch -- "a b.txt" "c.txt"
+args=(-1)
+cmd=(ls "${args[@]}")
+echo "$("${cmd[@]}" | tr '\n' ' ')"
+```
+
+```text output
+a b.txt c.txt 
+```
+
+## `[[ ]]` and `(( ))` in bash; `[ ]` only in `sh`
+
+`[[ ]]` does not word-split, so an empty value is safe. `(( ))` is
+the arithmetic test.
+
+```bash file=n05.sh
 var=""
-[[ -z $var ]] && show "[[ ]]" "no quoting worries with empty"
+[[ -z $var ]] && echo "no quoting worries with empty"
+(( 2 + 2 == 4 )) && echo "arithmetic ok"
+```
 
-# 6. Command substitution: $(...) not backticks; nests cleanly.
-show "nesting" "$(basename "$(dirname "/a/b/c")")"
+```text output
+no quoting worries with empty
+arithmetic ok
+```
 
-# 7. read -r, IFS= for raw lines.
-printf '  keep leading\n' | { IFS= read -r line; show "raw read" "[$line]"; }
+## `$(...)` nests; backticks do not
 
-# 8. printf, not echo, for data.
-s='-n'; show "printf safe" "$(printf '%s' "$s")"
+Backticks need backslash gymnastics the moment a command contains
+another command. `$(...)` is just quotes.
 
-# 9. Variables: lowercase locals, UPPERCASE exports/constants, readonly.
+```bash file=n06.sh
+echo "$(basename "$(dirname "/a/b/c")")"
+```
+
+```text output
+b
+```
+
+## `IFS= read -r` keeps the bytes of the line
+
+The default `read` strips leading whitespace and eats backslashes.
+Data in, data out, means both flags.
+
+```bash file=n07.sh
+printf '  keep leading\n' | { IFS= read -r line; echo "[$line]"; }
+```
+
+```text output
+[  keep leading]
+```
+
+## `printf` for data, `echo` for a fixed message
+
+`echo` is fine for a sentence you typed yourself. It is the wrong
+tool for a value that might be `-n` or might contain a backslash.
+
+```bash file=n08.sh
+s='-n'
+printf '%s\n' "$(printf '%s' "$s")"
+```
+
+```text output
+-n
+```
+
+## `local` in functions, `readonly` for constants
+
+Lowercase names are locals. UPPERCASE is for exports and constants.
+A `readonly` name cannot be assigned again, including in a subshell.
+
+```bash file=n09.sh
+set -euo pipefail
 readonly VERSION="1.2.3"
 ( VERSION=2 ) 2>&1 | sed 's/^.*: //' || true
-show "constant" "$VERSION"
+echo "constant: $VERSION"
+f() { local name="ada"; echo "$name"; }
+f
+```
 
-# 10. Do not use `cat file | cmd`, `echo $var | cmd`, or `ls | grep`.
+```text output
+readonly variable
+constant: 1.2.3
+ada
+```
+
+## `mktemp` and `trap EXIT` own every temp file
+
+The trap runs on the way out, including after a failure. The
+directory name is unique, so two runs do not collide.
+
+```bash file=n10.sh
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"; echo cleaned' EXIT
+echo work > "$tmp/f"
+[[ -f $tmp/f ]] && echo "temp exists"
+```
+
+```text output
+temp exists
+cleaned
+```
+
+## Errors go to stderr; data stays on stdout
+
+The status is part of the interface. A pipeline can still read the
+data when the message is on the other stream.
+
+```bash file=n11.sh
+die() { echo "error: $*" >&2; return 2; }
+die "nope" || echo "status $?"
+```
+
+```text output
+error: nope
+status 2
+```
+
+## Redirect and here-strings beat a useless `cat`
+
+`cmd < file` replaces `cat file | cmd`. `cmd <<< "$var"` replaces
+`echo "$var" | cmd`. Both skip a process. `$(( ))` also strips the
+padding some `wc` builds put on a count.
+
+```bash file=n12.sh
+tmp=$(mktemp -d)
+cd "$tmp"
 printf 'x\n' > one.txt
-show "redirect" "$(wc -l < one.txt | tr -d ' ')"
-show "here-string" "$(tr a-z A-Z <<< "$f")"
+echo "$(( $(wc -l < one.txt) ))"
+f="a b.txt"
+tr a-z A-Z <<< "$f"
+```
 
-# 11. Functions + main; source-safe entry point.
-main() { show "main" "ran with $# args"; }
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
+```text output
+1
+A B.TXT
+```
 
-# 12. Cleanup with trap, temp files with mktemp (done above).
-# 13. Use `local` and check substitutions separately.
+## Guard `main` so the file can be sourced
+
+`[[ ${BASH_SOURCE[0]} == "$0" ]]` is true when you ran the file, and
+false when another script sourced it. A test can then call functions
+without running the program. A script that "works on my machine"
+often depends on the locale, GNU versus BSD flags, `$PATH`, the
+current directory, or a tty. Set `LC_ALL`, check tools with
+`command -v`, and take paths from `${BASH_SOURCE[0]}`.
+
+```bash file=n13.sh
+tmp=$(mktemp -d)
+cat > "$tmp/lib.sh" << 'EOF'
+main() { echo "ran"; }
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+else
+  echo "loaded"
+fi
+EOF
+echo "executed: $(bash "$tmp/lib.sh")"
+echo "sourced: $(bash -c "source \"$tmp/lib.sh\"")"
+```
+
+```text output
+executed: ran
+sourced: loaded
+```
+
+## Assign after `local`, and check that status
+
+`set -e` does not see `local out=$(failing)`. Write `local out` and
+then `out=$(cmd) || return`. Put `|| return` or `|| die` on the
+commands that matter. `if` turns `set -e` off for the whole call.
+
+```bash file=n14.sh
+set -euo pipefail
 f2() {
   local out
-  out=$(printf 'value')                       # failure would propagate
+  out=$(printf 'value')
   echo "$out"
 }
-show "local then assign" "$(f2)"
+echo "$(f2)"
+bad() { local out; out=$(false) || return 3; echo "nope"; }
+bad || echo "returned $?"
+```
 
-# 14. Prefer built-ins to forks in hot loops.
+```text output
+value
+returned 3
+```
+
+## Parameter expansion beats a fork in a loop
+
+`basename` starts a process. `${path##*/}` does not. In a tight loop
+that difference is the whole runtime.
+
+```bash file=n15.sh
 path=/a/b/c.txt
-show "no fork" "${path##*/} vs $(basename "$path")"
+echo "${path##*/} vs $(basename "$path")"
+```
 
-# 15. A dependency check up front.
-require() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; return 1; }; }
-require bash && show "dependency" "bash found"
+```text output
+c.txt vs c.txt
+```
+
+## Check a tool before you call it
+
+`command -v` is true when the name is on `PATH`. Fail there, with a
+message on stderr, instead of failing halfway through the work.
+
+```bash file=n16.sh
+require() {
+  command -v "$1" >/dev/null || { echo "missing: $1" >&2; return 1; }
+}
+require bash && echo "bash found"
 require not-a-real-tool 2>&1 || true
 ```
 
 ```text output
-unquoted: ls: cannot access 'a': No such
-quoted: a b.txt
-glob loop: 3 files
-removed: -weird.txt
-array command: a b.txt c.txt 
-[[ ]]: no quoting worries with empty
-nesting: b
-raw read: [  keep leading]
-printf safe: -n
-readonly variable
-constant: 1.2.3
-redirect: 1
-here-string: A B.TXT
-main: ran with 0 args
-local then assign: value
-no fork: c.txt vs c.txt
-dependency: bash found
+bash found
 missing: not-a-real-tool
 ```
 
-## The checklist
+## `${var:-default}` fills a missing value
 
-1. `#!/usr/bin/env bash` and `set -euo pipefail`; know what each does and
-   when to loosen it (lesson 07).
-2. Quote all expansions; use arrays for lists; `"$@"` for passthrough.
-3. `[[ ]]` and `(( ))` in bash; `[ ]` only in portable `sh`.
-4. `$(...)`, never backticks.
-5. `printf` for data, `echo` for fixed messages.
-6. `local` for every function variable; `readonly` for constants.
-7. `mktemp` + `trap EXIT` for anything temporary.
-8. Errors to stderr, data to stdout, meaningful exit codes.
-9. Prefer built-in parameter expansion to forking `sed`/`awk`/`basename`.
-10. Run [`shellcheck`](https://www.shellcheck.net/) on every script; it
-    knows these rules (SC2086 is "quote this"). Run `shfmt` for layout.
-11. If a script passes ~200 lines, needs real data structures, or parses
-    structured data, reach for Python or Go instead.
+The default is used when the variable is unset or empty. A value that
+is already set is left alone. `${name,,}` is the lowercase copy in bash
+4.
 
-## Details that bite
+```bash file=n17.sh
+unset APP_PORT
+echo "default ${APP_PORT:-80}"
+APP_PORT=8080
+echo "set ${APP_PORT:-80}"
+name="Ada"
+echo "${name,,}"
+```
 
-- ShellCheck cannot know your data. It flags the *pattern*; you decide
-  whether the file name might contain spaces.
-- `set -e` interacts with functions and `if` in surprising ways: write
-  explicit `|| return` / `|| die` on the commands that matter.
-- Do not parse `ls`, `ps`, or `df` output when a machine-readable option
-  exists (`stat -c`, `ps -o pid=`, `df --output`).
-- A script that "works on my machine" often depends on locale, GNU vs BSD
-  flags, `$PATH`, the current directory, or a tty. Set `LC_ALL`, check
-  tools with `command -v`, resolve paths from `${BASH_SOURCE[0]}`.
-- Do not run `sudo` inside scripts you did not write; do not
-  `curl ... | bash` anything you have not read.
+```text output
+default 80
+set 8080
+ada
+```
 
 ## Exercises
 

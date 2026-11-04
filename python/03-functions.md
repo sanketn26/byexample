@@ -3,73 +3,217 @@
 Functions are first-class objects: you can pass them, return them, and store
 them in data structures.
 
-## Example
+## Some parameters are optional or keyword-only
 
-```python file=example.py
-# Defaults, keyword arguments, *args and **kwargs
+A default is fixed when the function is defined, not when it is called.
+`*` makes every following parameter keyword-only. `/` makes the parameters
+before it positional-only. `*args` collects extra positionals and `**kwargs`
+collects extra keywords.
+
+```python file=n01.py
 def greet(name, greeting="Hello", *, punct="!"):
     return f"{greeting}, {name}{punct}"
 
-print(greet("Ada"))
-print(greet("Ada", "Hi", punct="?"))
 
 def summarize(*nums, **opts):
     total = sum(nums)
     return total if not opts.get("double") else total * 2
 
-print(summarize(1, 2, 3), summarize(1, 2, 3, double=True))
 
-# Multiple return values are just a tuple
+def div(a, b, /):
+    return a // b
+
+
+print(greet("Ada"))
+print(greet("Ada", "Hi", punct="?"))
+print(summarize(1, 2, 3), summarize(1, 2, 3, double=True))
+print(div(7, 2))
+try:
+    greet("Ada", "Hi", "?")
+except TypeError as e:
+    print("keyword-only", type(e).__name__)
+try:
+    div(a=7, b=2)
+except TypeError as e:
+    print("positional-only", type(e).__name__)
+```
+
+```text output
+Hello, Ada!
+Hi, Ada?
+6 12
+3
+keyword-only TypeError
+positional-only TypeError
+```
+
+## Several return values are one tuple
+
+`return a, b` builds a tuple. The caller unpacks it into names.
+
+```python file=n02.py
 def min_max(xs):
     return min(xs), max(xs)
 
+
 lo, hi = min_max([4, 9, 2])
 print(lo, hi)
+```
 
-# Unpacking into a call
+```text output
+2 9
+```
+
+## A call can unpack a sequence or a mapping
+
+`*seq` fills positional arguments. `**mapping` fills keyword arguments.
+
+```python file=n03.py
+def greet(name, greeting="Hello", *, punct="!"):
+    return f"{greeting}, {name}{punct}"
+
+
+def summarize(*nums, **opts):
+    total = sum(nums)
+    return total if not opts.get("double") else total * 2
+
+
 args = [1, 2, 3]
 print(summarize(*args), greet(**{"name": "Bob", "greeting": "Yo"}))
+```
 
-# Closures capture variables, not values
+```text output
+6 Yo, Bob!
+```
+
+## A closure sees the variable, not a copy
+
+The inner function reads `count` from the enclosing scope. `nonlocal` lets
+it assign to that name. An assignment without `nonlocal` would make a new
+local instead.
+
+```python file=n04.py
 def counter():
     count = 0
+
     def inc():
         nonlocal count
         count += 1
         return count
+
     return inc
+
 
 c = counter()
 print(c(), c(), c())
+```
 
-# Higher-order functions and lambdas
+```text output
+1 2 3
+```
+
+## Assignment makes a name local
+
+`global` rebinds a module-level name. Mutating an object needs neither
+`global` nor `nonlocal`. Reading a name you also assign, with no declaration,
+raises `UnboundLocalError`.
+
+```python file=n05.py
+count = 0
+items = []
+
+
+def bump():
+    global count
+    count += 1
+
+
+def add(x):
+    items.append(x)
+
+
+def local_trap():
+    count += 1
+
+
+bump()
+add(1)
+print(count, items)
+try:
+    local_trap()
+except UnboundLocalError as e:
+    print(type(e).__name__)
+```
+
+```text output
+1 [1]
+UnboundLocalError
+```
+
+## Functions are values
+
+Pass them to `sorted`, `map`, and `filter`. A `lambda` is a function
+expression with no name of its own.
+
+```python file=n06.py
 words = ["pear", "fig", "banana", "kiwi"]
 print(sorted(words, key=len))
 print(list(map(str.upper, words[:2])))
 print(list(filter(lambda w: len(w) == 4, words)))
+```
 
-# Decorators wrap functions
+```text output
+['fig', 'pear', 'kiwi', 'banana']
+['PEAR', 'FIG']
+['pear', 'kiwi']
+```
+
+## A decorator wraps a function
+
+The wrapper runs around the original call. `functools.wraps` copies the
+original name onto the wrapper so traces still say `add`.
+
+```python file=n07.py
 import functools
+
 
 def logged(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
         print(f"calling {fn.__name__}{a}")
         return fn(*a, **kw)
+
     return wrapper
+
 
 @logged
 def add(a, b):
     return a + b
 
-print(add(2, 3))
 
-# THE classic trap: mutable default arguments are created once
+print(add(2, 3))
+print(add.__name__)
+```
+
+```text output
+calling add(2, 3)
+5
+add
+```
+
+## A mutable default is created once
+
+Every call that omits `bucket` shares that one list, so the values
+accumulate. Use `None` as a sentinel and create the list inside the body.
+
+```python file=n08.py
 def append_bad(x, bucket=[]):
     bucket.append(x)
     return bucket
 
+
 print(append_bad(1), append_bad(2))
+
 
 def append_good(x, bucket=None):
     if bucket is None:
@@ -77,56 +221,78 @@ def append_good(x, bucket=None):
     bucket.append(x)
     return bucket
 
-print(append_good(1), append_good(2))
 
-# Late binding in closures
+print(append_good(1), append_good(2))
+```
+
+```text output
+[1, 2] [1, 2]
+[1] [2]
+```
+
+## Lambdas in a loop share one variable
+
+Each lambda reads `i` when it is called, after the loop has finished.
+Bind the current value with a default argument: `lambda i=i: i`.
+
+```python file=n09.py
 fns = [lambda: i for i in range(3)]
 print([f() for f in fns])
 fns = [lambda i=i: i for i in range(3)]
 print([f() for f in fns])
+```
 
-# Generators produce values lazily
+```text output
+[2, 2, 2]
+[0, 1, 2]
+```
+
+## `yield` pauses a function
+
+A generator produces values lazily. `islice` pulls a finite prefix from a
+generator that would otherwise run forever.
+
+```python file=n10.py
+from itertools import islice
+
+
 def fib():
     a, b = 0, 1
     while True:
         yield a
         a, b = b, a + b
 
-from itertools import islice
+
 print(list(islice(fib(), 8)))
 ```
 
 ```text output
-Hello, Ada!
-Hi, Ada?
-6 12
-2 9
-6 Yo, Bob!
-1 2 3
-['fig', 'pear', 'kiwi', 'banana']
-['PEAR', 'FIG']
-['pear', 'kiwi']
-calling add(2, 3)
-5
-[1, 2] [1, 2]
-[1] [2]
-[2, 2, 2]
-[0, 1, 2]
 [0, 1, 1, 2, 3, 5, 8, 13]
 ```
 
-## Details that bite
+## The parameter is another name for the object
 
-- Default values are evaluated **once**, at definition time. Use `None` as a
-  sentinel for mutable defaults.
-- Closures see the *variable*, so lambdas created in a loop all share the
-  final value; bind with a default argument (`lambda i=i: i`).
-- Assigning to a name inside a function makes it local. Use `nonlocal` /
-  `global` to rebind outer names. Mutating (`lst.append`) needs neither.
-- Arguments are passed by *object reference*: rebinding a parameter does not
-  affect the caller, but mutating the object does.
-- `*` in a signature makes later parameters keyword-only; `/` makes earlier
-  ones positional-only.
+Arguments are passed by object reference. Appending changes the caller's
+list. Assigning to the parameter rebinds only the local name.
+
+```python file=n11.py
+def mutate(xs):
+    xs.append("m")
+
+
+def rebind(xs):
+    xs = ["new"]
+    return xs
+
+
+data = []
+mutate(data)
+print(rebind(data), data)
+```
+
+```text output
+['new'] ['m']
+```
 
 ## Exercises
 

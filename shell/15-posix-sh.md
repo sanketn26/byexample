@@ -1,111 +1,230 @@
 # Shell 15 — Portable POSIX `sh`
 
-Bash is everywhere you control the machine. In containers (`alpine` has
-BusyBox `ash`), Debian's `/bin/sh` (`dash`), installers and Makefiles, you
-get **POSIX `sh`**: smaller, faster, and without arrays, `[[ ]]`, `local`
-(officially), `${var^^}`, `<(...)` or `==` in `[ ]`.
+Bash is what you get on a machine you control. In containers (Alpine
+has BusyBox `ash`), Debian's `/bin/sh` (`dash`), installers, and
+Makefiles, you get POSIX `sh`: smaller, and without arrays, `[[ ]]`,
+`${var^^}`, `<(...)`, or `==` inside `[ ]`. The shebang decides.
+`#!/bin/sh` means POSIX only, even when `/bin/sh` is bash. Bash then
+runs in a restricted mode and still accepts bashisms that dash
+rejects. Test with `dash` or `busybox sh` before you ship.
+`shellcheck -s sh` reports every bashism. If you need arrays, maps, or
+non-trivial string handling, require bash (`#!/usr/bin/env bash`) and
+say so. Do not contort `sh` to avoid it.
 
-## Example
+## This `sh` still accepts some bashisms
 
-```bash file=example.sh
-#!/usr/bin/env bash
-# This lesson's example runs small scripts under `sh` (dash on Debian/Ubuntu,
-# BusyBox ash on Alpine) and shows what breaks and what the portable form is.
+The checks below call `sh`, the way a `#!/bin/sh` script will. On a
+machine whose `sh` is bash, `[[ ]]`, arrays, and `==` still run.
+Process substitution and `${var^^}` do not.
 
-run_sh() { sh -c "$1" 2>&1; }
-works()  { if sh -c "$1" >/dev/null 2>&1; then echo works; else echo "fails"; fi; }
-
-echo "--- bashisms that fail in dash/ash (bash-as-sh may accept them)"
+```bash file=n01.sh
+works() { if sh -c "$1" >/dev/null 2>&1; then echo works; else echo fails; fi; }
 echo "[[ ]]:  $(works '[[ -n x ]]')"
 echo "arrays: $(works 'a=(1 2); echo ${a[0]}')"
 echo "==:     $(works '[ a == a ]')"
 echo "<( ):   $(works 'cat <(echo hi)')"
 echo "^^:     $(works 'w=hi; echo ${w^^}')"
+```
 
-echo "--- portable replacements"
-# 1. Tests: [ ] with = and quoting; combine with && and ||, not -a / -o
-run_sh 'x=""; if [ -z "$x" ] && [ "$#" -eq 0 ]; then echo "empty and no args"; fi'
+```text output
+[[ ]]:  works
+arrays: works
+==:     works
+<( ):   fails
+^^:     fails
+```
 
-# 2. case instead of [[ == glob ]] / =~
-run_sh 'f=notes.txt; case $f in *.txt) echo "text file";; *) echo other;; esac'
+## `dash` rejects those bashisms
 
-# 3. Positional parameters are the only array: set --, shift, "$@"
-run_sh 'set -- a "b c" d; for x in "$@"; do printf "<%s>" "$x"; done; echo'
+`dash` is a strict `sh`. The same five snippets all fail there.
+`declare`, `typeset -A`, `mapfile`, `read -a`, and `${!var}` are not
+portable either. `local` is not in POSIX, but dash, ash, and bash all
+accept it.
 
-# 4. Arithmetic: $(( )) works; (( )) does not
-run_sh 'i=0; i=$((i + 1)); echo "i=$i"'
+```bash file=n02.sh
+works() { if dash -c "$1" >/dev/null 2>&1; then echo works; else echo fails; fi; }
+echo "[[ ]]:  $(works '[[ -n x ]]')"
+echo "arrays: $(works 'a=(1 2); echo ${a[0]}')"
+echo "==:     $(works '[ a == a ]')"
+echo "<( ):   $(works 'cat <(echo hi)')"
+echo "^^:     $(works 'w=hi; echo ${w^^}')"
+dash -c 'declare x=1' >/dev/null 2>&1 || echo "declare: fails"
+```
 
-# 5. Parameter expansion: # ## % %% :- := :? are POSIX; ^^ ,, / // : are not
-run_sh 'p=/a/b/c.txt; echo "${p##*/} ${p%/*} ${p%.txt}"'
+```text output
+[[ ]]:  fails
+arrays: fails
+==:     fails
+<( ):   fails
+^^:     fails
+declare: fails
+```
 
-# 6. printf, not echo -n / echo -e
-run_sh 'printf "%d items, %s\n" 3 "no echo -n needed"'
+## `[ ]` is the POSIX test
 
-# 7. command -v, not which or type -p
-run_sh 'command -v ls >/dev/null && echo "ls available"'
+Use `=` , not `==`. Combine tests with `&&` and `||`, not `-a` or
+`-o`. Quote every expansion. `[ -n $x ]` with an empty `x` is true:
+the command becomes `[ -n ]`, which tests the string `-n`.
 
-# 8. No process substitution: use a pipe, a temp file, or a here-doc
-run_sh 'printf "b\na\n" | sort | while read -r l; do printf "%s " "$l"; done; echo'
-run_sh 'while read -r l; do printf "[%s]" "$l"; done <<EOF
+```bash file=n03.sh
+sh -c 'x=""; [ -n $x ] && echo "unquoted is true"; [ -n "$x" ] || echo "quoted is false"'
+sh -c 'x=""; if [ -z "$x" ] && [ "$#" -eq 0 ]; then echo "empty and no args"; fi'
+```
+
+```text output
+unquoted is true
+quoted is false
+empty and no args
+```
+
+## `case` is the portable pattern match
+
+There is no `[[ == glob ]]` and no `=~`. `case` patterns are globs.
+The first match wins.
+
+```bash file=n04.sh
+sh -c 'f=notes.txt; case $f in *.txt) echo "text file";; *) echo other;; esac'
+```
+
+```text output
+text file
+```
+
+## The positional parameters are the only array
+
+`set --` replaces them. `shift` drops the first. `"$@"` keeps each
+argument, spaces included. There is nowhere to store a second list.
+
+```bash file=n05.sh
+sh -c 'set -- a "b c" d; for x in "$@"; do printf "<%s>" "$x"; done; echo'
+```
+
+```text output
+<a><b c><d>
+```
+
+## Arithmetic is `$(( ))`
+
+The double-parentheses command `(( ))` is bash. Assignment through
+`$(( ))` is POSIX, and the result is text, like everything else.
+
+```bash file=n06.sh
+sh -c 'i=0; i=$((i + 1)); echo "i=$i"'
+```
+
+```text output
+i=1
+```
+
+## A few expansions are POSIX
+
+`#`, `##`, `%`, `%%`, `:-`, `:=`, and `:?` are. `^^`, `,,`, `/`,
+`//`, and the substring form `${var:offset}` are not. Patterns here
+are globs.
+
+```bash file=n07.sh
+sh -c 'p=/a/b/c.txt; echo "${p##*/} ${p%/*} ${p%.txt}"'
+```
+
+```text output
+c.txt /a/b /a/b/c
+```
+
+## `printf` is the portable output
+
+`echo -n` and `echo -e` differ per shell. `printf` does not. GNU and
+BSD tools matter as much as the shell: `sed -i`, `date -d`, `stat`,
+`readlink -f`, `xargs -r`, and `grep -P` are GNU. macOS has the BSD
+versions. Stick to POSIX flags, or test on each target.
+
+```bash file=n08.sh
+sh -c 'printf "%d items, %s\n" 3 "no echo -n needed"'
+```
+
+```text output
+3 items, no echo -n needed
+```
+
+## `command -v` finds a program
+
+`which` and `type -p` are not the portable check. `command -v` is
+silent when you redirect it, and its status is the answer.
+
+```bash file=n09.sh
+sh -c 'command -v ls >/dev/null && echo "ls available"'
+```
+
+```text output
+ls available
+```
+
+## A pipe or a here-doc replaces `<(...)`
+
+POSIX `sh` has no process substitution. A pipe, a temp file, or a
+here-doc feeds stdin. The `while read` in a pipe still runs in a
+subshell, on bash and on dash.
+
+```bash file=n10.sh
+sh -c 'printf "b\na\n" | sort | while read -r l; do printf "%s " "$l"; done; echo'
+sh -c 'while read -r l; do printf "[%s]" "$l"; done <<EOF
 one
 two
 EOF
 echo'
+```
 
-# 9. Functions: name() { ...; } only; `local` is accepted by dash, ash and
-#    bash, though it is not strictly POSIX.
-run_sh 'f() { local v=1; echo "v=$v"; }; f'
+```text output
+a b 
+[one][two]
+```
 
-# 10. set -e / -u work; pipefail does not exist in POSIX sh (before 2024).
-run_sh 'set -eu; echo strict-ok'
+## A function is `name()`
 
-echo "--- which shell is sh here?"
+The only portable form is `name() { ...; }`. `local` happens to work
+on dash, ash, and bash. Do not depend on it if the script must be
+strict POSIX, and do not use `declare`.
+
+```bash file=n11.sh
+sh -c 'f() { local v=1; echo "v=$v"; }; f'
+```
+
+```text output
+v=1
+```
+
+## `set -e` and `set -u` are POSIX
+
+`pipefail` was not, before the 2024 revision. This machine's `sh` is
+bash, so it accepts `pipefail` and a failing stage fails the
+pipeline. dash rejects the option.
+
+```bash file=n12.sh
+sh -c 'set -eu; echo strict-ok'
+sh -c 'set -o pipefail; false | true; echo "sh pipefail:$?"'
+dash -c 'set -o pipefail' >/dev/null 2>&1 || echo "dash: no pipefail"
+```
+
+```text output
+strict-ok
+sh pipefail:1
+dash: no pipefail
+```
+
+## Compare `sh` with `bash` before you assume
+
+`readlink -f` resolves both names. If they differ, `/bin/sh` is not
+your bash, and a script that worked under `bash` can still fail under
+`sh`. GNU `readlink -f` is not on every BSD. This host has it.
+
+```bash file=n13.sh
 if [ "$(readlink -f "$(command -v sh)")" != "$(readlink -f "$(command -v bash)")" ]; then
   echo "sh is not bash"
 fi
 ```
 
 ```text output
---- bashisms that fail in dash/ash (bash-as-sh may accept them)
-[[ ]]:  fails
-arrays: fails
-==:     fails
-<( ):   fails
-^^:     fails
---- portable replacements
-empty and no args
-text file
-<a><b c><d>
-i=1
-c.txt /a/b /a/b/c
-3 items, no echo -n needed
-ls available
-a b 
-[one][two]
-v=1
-strict-ok
---- which shell is sh here?
 sh is not bash
 ```
-
-## Details that bite
-
-- **Shebang decides the shell**: `#!/bin/sh` means POSIX only, even if
-  `/bin/sh` is bash on your machine (it then runs in a restricted mode, but
-  still accepts bashisms that dash will reject). Test with `dash` or
-  `busybox sh` before shipping.
-- `shellcheck -s sh script.sh` reports every bashism for you.
-- `local` is not in POSIX, yet every real `sh` accepts it. `declare`,
-  `typeset -A`, `mapfile`, `read -a` and `${!var}` are not portable.
-- `echo` flags and escape handling differ per shell. `printf` does not.
-- GNU vs BSD tools matter as much as the shell: `sed -i`, `date -d`,
-  `stat`, `readlink -f`, `xargs -r`, `grep -P` are GNU. macOS has BSD
-  versions. Stick to POSIX flags or test on each target.
-- Use `[ ]` carefully: `[ -n $x ]` with empty `x` is *true* (it tests the
-  string `-n`). Always quote: `[ -n "$x" ]`.
-- Decide per script: if you need arrays, associative maps, or non-trivial
-  string handling, require bash (`#!/usr/bin/env bash`) and say so. Do not
-  contort `sh` code to avoid it.
 
 ## Exercises
 

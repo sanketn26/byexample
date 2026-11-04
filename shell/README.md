@@ -1,7 +1,8 @@
 # Shell by Example (practice edition)
 
 Bash 4.4+ on Linux (macOS ships bash 3.2: install a newer one with
-`brew install bash`). Each lesson is one `bash` script: `bash example.sh`.
+`brew install bash`). Each lesson is a series of tiny scripts, one concept
+each: `bash n01.sh`, then `n02.sh`.
 Exercises use a tiny `check` helper and exit non-zero until solved.
 Lesson 15 targets POSIX `sh`.
 

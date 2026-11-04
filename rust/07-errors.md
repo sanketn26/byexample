@@ -1,14 +1,21 @@
 # Rust 07 — Error Handling
 
-No exceptions. Recoverable failures are `Result<T, E>`, absence is
-`Option<T>`, and the `?` operator propagates errors upward. `panic!` is for
-bugs.
+There are no exceptions. A recoverable failure is `Result<T, E>`. Absence
+without a reason is `Option<T>`. The `?` operator returns the error to the
+caller. `panic!` is for bugs, not for bad input.
 
-## Example
+## `?` needs a `From` conversion
 
-```rust file=example.rs
+`?` on a `Result` returns early on `Err`, and it calls `From::from` so the
+error type can change on the way out. `Display` is the message a person
+reads. `unwrap` and `expect` panic on `Err` or `None`. Fine in a test or a
+prototype. A library returns the `Result`.
+
+`?` only compiles in a function whose return type can absorb that error.
+`main` itself may return `Result<(), E>`.
+
+```rust file=n01.rs
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt;
 use std::num::ParseIntError;
 
@@ -29,16 +36,6 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl Error for ConfigError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            ConfigError::BadNumber(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-// `?` calls From::from on the error, so this conversion makes it automatic
 impl From<ParseIntError> for ConfigError {
     fn from(e: ParseIntError) -> Self {
         ConfigError::BadNumber(e)
@@ -46,19 +43,134 @@ impl From<ParseIntError> for ConfigError {
 }
 
 fn get_port(cfg: &HashMap<&str, &str>) -> Result<u16, ConfigError> {
-    let raw = cfg
-        .get("port")
-        .ok_or_else(|| ConfigError::Missing("port".into()))?;
-    let n: i64 = raw.parse()?; // ParseIntError -> ConfigError
+    let raw = cfg.get("port").ok_or_else(|| ConfigError::Missing("port".into()))?;
+    let n: i64 = raw.parse()?;
     u16::try_from(n).map_err(|_| ConfigError::OutOfRange(n))
 }
 
-// Sum<Result<..>> short-circuits on the first Err
+fn main() {
+    let mut cfg = HashMap::new();
+    cfg.insert("port", "8080");
+    println!("{:?}", get_port(&cfg));
+    for value in ["http", "70000"] {
+        cfg.insert("port", value);
+        println!("{}", get_port(&cfg).unwrap_err());
+    }
+    cfg.clear();
+    println!("{}", get_port(&cfg).unwrap_err());
+}
+```
+
+```text output
+Ok(8080)
+bad number: invalid digit found in string
+70000 is out of range
+missing key: port
+```
+
+## `Error::source` chains the cause
+
+Implement `Display` for the reader and `Error::source` for the error that
+caused this one. Libraries should expose a concrete error type, often an
+enum. Applications can use `Box<dyn Error>` (or the `anyhow` crate) when
+they only need to report the failure. Do not use `Option` when the caller
+needs to know why it failed: `None` has no reason attached.
+
+```rust file=n02.rs
+use std::error::Error;
+use std::fmt;
+use std::num::ParseIntError;
+
+#[derive(Debug)]
+enum ConfigError {
+    BadNumber(ParseIntError),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ConfigError::BadNumber(e) => write!(f, "bad number: {e}"),
+        }
+    }
+}
+
+impl Error for ConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConfigError::BadNumber(e) => Some(e),
+        }
+    }
+}
+
+fn main() {
+    let bad = "x".parse::<i32>().unwrap_err();
+    println!("{}", ConfigError::BadNumber(bad).source().is_some());
+}
+```
+
+```text output
+true
+```
+
+## `Box<dyn Error>` accepts any error
+
+The `?` in `run` turns a `ParseIntError` into a boxed trait object. The
+caller prints it. A returned `Err` from `main` would do the same and then
+exit non-zero.
+
+```rust file=n03.rs
+use std::error::Error;
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let n: i32 = "12x".parse()?;
+    println!("{n}");
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        println!("run failed: {e}");
+    }
+}
+```
+
+```text output
+run failed: invalid digit found in string
+```
+
+## Iterators of `Result` stop at the first error
+
+`sum` on an iterator of `Result` is `Ok` only when every item parses.
+`collect` does the same and builds the `Vec` only on success. `Result` is
+`#[must_use]`: throwing one away is a warning, and these lessons treat
+warnings as errors.
+
+```rust file=n04.rs
+use std::num::ParseIntError;
+
 fn sum_all(items: &[&str]) -> Result<i32, ParseIntError> {
     items.iter().map(|s| s.parse::<i32>()).sum()
 }
 
-// `?` works on Option too
+fn main() {
+    println!("{:?} {}", sum_all(&["1", "2", "3"]), sum_all(&["1", "x"]).is_err());
+    let r: Result<Vec<i32>, _> = ["1", "2", "3"].iter().map(|s| s.parse::<i32>()).collect();
+    println!("{r:?}");
+}
+```
+
+```text output
+Ok(6) true
+Ok([1, 2, 3])
+```
+
+## `?` works on `Option` too
+
+It returns `None` early. The combinators `map`, `and_then`, `ok_or`, and
+`unwrap_or_else` cover the same ground as a nested `match`, and they usually
+read better.
+
+```rust file=n05.rs
 fn first_even(xs: &[i32]) -> Option<i32> {
     xs.iter().copied().find(|x| x % 2 == 0)
 }
@@ -68,44 +180,46 @@ fn describe(xs: &[i32]) -> Option<String> {
     Some(format!("even {e}"))
 }
 
-// Box<dyn Error> accepts any error type: convenient in applications
-fn run() -> Result<(), Box<dyn Error>> {
-    let n: i32 = "12x".parse()?;
-    println!("{n}");
-    Ok(())
-}
-
 fn main() {
-    let mut cfg = HashMap::new();
-    cfg.insert("port", "8080");
-    println!("{:?}", get_port(&cfg));
-
-    for (key, value) in [("port", "http"), ("port", "70000")] {
-        cfg.insert(key, value);
-        if let Err(e) = get_port(&cfg) {
-            println!("{e}");
-        }
-    }
-    cfg.clear();
-    if let Err(e) = get_port(&cfg) {
-        println!("{e}");
-    }
-
-    println!("{:?} {}", sum_all(&["1", "2", "3"]), sum_all(&["1", "x"]).is_err());
-    let r: Result<Vec<i32>, _> = ["1", "2", "3"].iter().map(|s| s.parse::<i32>()).collect();
-    println!("{r:?}");
     println!("{:?} {:?}", describe(&[1, 3, 4]), describe(&[1, 3]));
+    let n = Some(2).map(|x| x + 1).and_then(|x| (x > 0).then_some(x));
+    println!("{n:?}");
+}
+```
 
-    if let Err(e) = run() {
-        println!("run failed: {e}");
-    }
+```text output
+Some("even 4") None
+Some(3)
+```
 
+## `unwrap_or` substitutes a value
+
+`unwrap` would panic on `"x"`. `unwrap_or` returns the fallback instead.
+`expect("why")` is `unwrap` with a message, for the cases that really are
+bugs.
+
+```rust file=n06.rs
+fn main() {
+    println!("{}", "42".parse::<i32>().expect("digits"));
     println!("{}", "x".parse::<i32>().unwrap_or(-1));
+}
+```
 
-    let bad = "x".parse::<i32>().unwrap_err();
-    println!("{}", ConfigError::BadNumber(bad).source().is_some());
+```text output
+42
+-1
+```
 
-    // A panic unwinds; catch_unwind exists but is for boundaries, not flow
+## `catch_unwind` is a boundary, not a control flow
+
+A panic unwinds the stack. Catch it only at a thread or an FFI edge: a panic
+that crosses FFI is undefined behaviour unless something catches it. A panic
+inside a thread kills that thread, not the process (lesson 11). The hook
+below hides the panic text so the program's own output stays one line.
+
+```rust file=n07.rs
+fn main() {
+    std::panic::set_hook(Box::new(|_| {}));
     let caught = std::panic::catch_unwind(|| {
         let v: Vec<i32> = Vec::new();
         v[0]
@@ -115,36 +229,8 @@ fn main() {
 ```
 
 ```text output
-Ok(8080)
-bad number: invalid digit found in string
-70000 is out of range
-missing key: port
-Ok(6) true
-Ok([1, 2, 3])
-Some("even 4") None
-run failed: invalid digit found in string
--1
-true
 true
 ```
-
-## Details that bite
-
-- `unwrap()` and `expect("why this can't fail")` panic on `Err`/`None`.
-  Fine in tests and prototypes; in libraries return the `Result`.
-- `?` only works in a function whose return type can absorb the error
-  (`Result<_, E>` where `E: From<ParseIntError>`, or `Option`). `main` may
-  return `Result<(), Box<dyn Error>>`.
-- Libraries should expose a concrete error type (often an enum, or
-  `thiserror`); applications can use `Box<dyn Error>` or `anyhow`.
-- Implement `Display` for people and `Error::source` to chain causes.
-- `Result` is `#[must_use]`: ignoring a returned `Result` is a warning.
-- Do not use `Option` for errors that carry a reason; the caller cannot
-  tell *why* it failed.
-- Panics in threads kill only that thread (see lesson 11); panics across
-  an FFI boundary are undefined behaviour unless handled.
-- `Option<T>` combinators (`map`, `and_then`, `ok_or`, `unwrap_or_else`)
-  usually read better than nested `match`.
 
 ## Exercises
 

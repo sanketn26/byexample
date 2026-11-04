@@ -1,18 +1,28 @@
 # C 17 — Advanced concurrency
 
-A thread per connection, with nothing to stop it and no ceiling on the queue, fails by exhausting memory or file descriptors. Bound the workers, bound the queue, wait with `poll` so a silent peer cannot block you forever, and make shutdown a flag the workers actually look at.
+A thread per connection, with nothing to stop it and no ceiling on the
+queue, fails by exhausting memory or file descriptors. Bound how many
+workers run, and bound how many jobs sit in the queue. Wait with `poll`
+so a silent peer cannot block you forever. Shutdown is a flag the workers
+actually look at. Join them before the process exits. An async runtime
+puts a scheduler under this shape; it does not remove the bound, the
+deadline, or the shutdown.
 
-## Example
+## The pool's high-water mark is the worker cap
 
-```c file=example.c
+The gate holds the first wave inside the job until `workers` of them
+have entered, then releases them. `max` is therefore 2, not whatever the
+scheduler happened to run. The four results are the squares, in job
+order. One thread per request, with no ceiling, dies by running out of
+memory or file descriptors. This pool refuses to start a third worker's
+worth of simultaneous work.
+
+```c file=n01.c
 #define _POSIX_C_SOURCE 200809L
-#include <poll.h>
 #include <pthread.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 struct pool {
     pthread_mutex_t mu;
@@ -27,14 +37,13 @@ struct pool {
     int arrived;
     int need;
     int open;
-    int stop;
 };
 
 static void *worker(void *arg) {
     struct pool *p = arg;
     for (;;) {
         pthread_mutex_lock(&p->mu);
-        if (p->stop || p->next >= p->n) {
+        if (p->next >= p->n) {
             pthread_mutex_unlock(&p->mu);
             return NULL;
         }
@@ -77,6 +86,7 @@ static int run_pool(int workers, int *jobs, int n, int *results, int *max_in) {
     }
     for (int i = 0; i < workers; i++) {
         if (pthread_create(&ts[i], NULL, worker, &p) != 0) {
+            free(ts);
             return -1;
         }
     }
@@ -98,24 +108,6 @@ static int run_pool(int workers, int *jobs, int n, int *results, int *max_in) {
     return 0;
 }
 
-struct stop_arg {
-    pthread_barrier_t *started;
-    pthread_mutex_t *mu;
-    pthread_cond_t *cv;
-    int *flag;
-};
-
-static void *stop_worker(void *arg) {
-    struct stop_arg *a = arg;
-    pthread_barrier_wait(a->started);
-    pthread_mutex_lock(a->mu);
-    while (!*a->flag) {
-        pthread_cond_wait(a->cv, a->mu);
-    }
-    pthread_mutex_unlock(a->mu);
-    return NULL;
-}
-
 int main(void) {
     int jobs[] = {0, 1, 2, 3};
     int results[4] = {0};
@@ -124,8 +116,30 @@ int main(void) {
         return 1;
     }
     printf("pool %d %d %d %d %d\n", results[0], results[1], results[2], results[3], max_in);
+    return 0;
+}
+```
 
-    /* Deadline: poll a pipe nobody writes. */
+```text output
+pool 0 1 4 9 2
+```
+
+## A deadline covers the whole wait
+
+`poll` on a pipe nobody writes returns 0 when the 30 milliseconds are
+up. That is the deadline. A 150-millisecond read timeout inside a
+transfer that retries forever is not one: the operation as a whole never
+ends. Close the descriptor, or give the read its own deadline, if a
+worker is blocked in a syscall. Setting a flag does not interrupt that
+syscall by itself.
+
+```c file=n02.c
+#define _POSIX_C_SOURCE 200809L
+#include <poll.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
     int fds[2];
     if (pipe(fds) != 0) {
         return 1;
@@ -135,9 +149,25 @@ int main(void) {
     printf("%s\n", pr == 0 ? "deadline" : "unexpected");
     close(fds[0]);
     close(fds[1]);
+    return 0;
+}
+```
 
-    /* Bounded queue: try_push fails once two slots are taken. A channel's
-       try_send is this check, under the mutex. */
+```text output
+deadline
+```
+
+## A full ring refuses the next push
+
+Two slots are the bound. The third item is not stored. That refusal is
+backpressure: the producer hears about it now. A blocking send hides the
+same problem on a thread you may not have to spare. `try_send` and
+`put_nowait` are this check, under a mutex when the ring is shared.
+
+```c file=n03.c
+#include <stdio.h>
+
+int main(void) {
     struct ring {
         int slot[2];
         int len;
@@ -151,25 +181,69 @@ int main(void) {
         accepted++;
     }
     printf("accepted %d\n", accepted);
+    return 0;
+}
+```
 
+```text output
+accepted 2
+```
+
+## Shutdown leaves the queued work with the caller
+
+The workers block on the flag. The main thread waits until both have
+incremented `ready`, so the flag is set only after they are inside that
+wait. A `pthread_barrier` is the same rendezvous on platforms that have
+one; macOS does not. They return without taking the four
+queued jobs. `stopped 4` means those jobs are still the caller's to drop
+or drain. Cancellation is cooperative: the flag does nothing until the
+worker looks at it.
+
+```c file=n04.c
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdio.h>
+
+struct stop_arg {
+    pthread_mutex_t *mu;
+    pthread_cond_t *cv;
+    int *flag;
+    int *ready;
+};
+
+static void *stop_worker(void *arg) {
+    struct stop_arg *a = arg;
+    pthread_mutex_lock(a->mu);
+    (*a->ready)++;
+    pthread_cond_broadcast(a->cv);
+    while (!*a->flag) {
+        pthread_cond_wait(a->cv, a->mu);
+    }
+    pthread_mutex_unlock(a->mu);
+    return NULL;
+}
+
+int main(void) {
     int flag = 0;
+    int ready = 0;
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
-    pthread_barrier_t started;
-    pthread_barrier_init(&started, NULL, 3);
-    struct stop_arg sa = {&started, &mu, &cv, &flag};
+    struct stop_arg sa = {&mu, &cv, &flag, &ready};
     pthread_t a, b;
-    pthread_create(&a, NULL, stop_worker, &sa);
-    pthread_create(&b, NULL, stop_worker, &sa);
-    pthread_barrier_wait(&started);
-    int left = 4; /* queued work the workers never take */
+    if (pthread_create(&a, NULL, stop_worker, &sa) != 0 ||
+        pthread_create(&b, NULL, stop_worker, &sa) != 0) {
+        return 1;
+    }
     pthread_mutex_lock(&mu);
+    while (ready < 2) {
+        pthread_cond_wait(&cv, &mu);
+    }
+    int left = 4;
     flag = 1;
     pthread_cond_broadcast(&cv);
     pthread_mutex_unlock(&mu);
     pthread_join(a, NULL);
     pthread_join(b, NULL);
-    pthread_barrier_destroy(&started);
     pthread_mutex_destroy(&mu);
     pthread_cond_destroy(&cv);
     printf("stopped %d\n", left);
@@ -178,36 +252,9 @@ int main(void) {
 ```
 
 ```text output
-pool 0 1 4 9 2
-deadline
-accepted 2
 stopped 4
 ```
 
-## Details that bite
-
-- Bound two numbers: how many workers run, and how many jobs sit in the
-  queue. One thread, goroutine or task per request, with no ceiling,
-  dies by running out of memory or file descriptors.
-- `max` in the pool output is the number you have to be able to explain.
-  The example holds the first wave of workers inside the job until that
-  many have entered, so the high-water mark is observable instead of
-  depending on the scheduler.
-- A full bounded channel (`put_nowait`, `select`/`default`, `try_send`,
-  a ring that refuses the next push) is backpressure. The producer hears
-  about it now. A blocking send hides the problem on a thread you may
-  not be able to spare.
-- A deadline covers the whole operation. A 150ms read timeout inside a
-  transfer that retries forever is not one. `context`, `recv_timeout`
-  and `poll` are the same idea.
-- Cancellation is cooperative. Cancelling a context or setting a flag
-  does nothing to a worker blocked in a syscall until that syscall is
-  also interruptible: close the fd, or give the read its own deadline.
-  The example's workers are alive, then told to stop, and the four
-  queued jobs stay queued (`stopped 4`) for the caller to drop or drain.
-- Join the workers before the process exits. Rust async runtimes add a
-  scheduler under this shape; they do not remove the bound, the deadline
-  or the shutdown.
 
 ## Exercises
 

@@ -1,34 +1,273 @@
 # C 04 — Arrays and Collections
 
-C has fixed-size arrays and pointers. Anything more (vectors, maps, sets) you
-build yourself — that is half the point of learning C.
+C has fixed-size arrays and pointers. Anything more — a vector, a map, a
+set — you build yourself. There is no bounds check: `a[5]` on a 5-element
+array is undefined. It may crash, corrupt memory, or seem to work. Build
+with `-fsanitize=address` to catch it. Indexes of an N-element array run
+from 0 through N-1.
 
-## Example
+## The rest of a partial initializer is zero
 
-```c file=example.c
+You name the first elements. The ones you omit are zero. A variable-length
+array (`int a[n]`) for an untrusted `n` can overflow the stack; allocate
+with `malloc` instead.
+
+```c file=n01.c
+#include <stdio.h>
+
+int main(void) {
+    int a[5] = {1, 2, 3};
+    for (int i = 0; i < 5; i++) {
+        printf("%d ", a[i]);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text output
+1 2 3 0 0 
+```
+
+## Designated initializers pick slots
+
+`[1] = 10` sets index 1 and leaves the rest zero, including the gap before
+the next named index.
+
+```c file=n02.c
+#include <stdio.h>
+
+int main(void) {
+    int sparse[6] = {[1] = 10, [4] = 40};
+    for (int i = 0; i < 6; i++) {
+        printf("%d ", sparse[i]);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text output
+0 10 0 0 40 0 
+```
+
+## sizeof an array is not sizeof a pointer
+
+`sizeof a / sizeof a[0]` works only where `a` is a real array. A parameter,
+or any pointer from `malloc`, has the size of a pointer: 8 here, not 20.
+Dividing that by `sizeof(int)` yields 2, not 5. `-Wsizeof-pointer-div`
+rejects that division, which is why the function prints `sizeof` of the
+pointer instead.
+
+```c file=n03.c
+#include <stdio.h>
+
+static size_t len_via_pointer(const int *p) {
+    return sizeof p;
+}
+
+int main(void) {
+    int a[5] = {1, 2, 3};
+    printf("%zu\n", sizeof a / sizeof a[0]);
+    printf("%zu\n", len_via_pointer(a));
+    return 0;
+}
+```
+
+```text output
+5
+8
+```
+
+## a[i] is *(a + i)
+
+`2[a]` is the same addition, written backwards. Subtracting two pointers
+into the same array counts elements, not bytes. A pointer may be one past
+the end (`a + 5`) but must not be dereferenced.
+
+```c file=n04.c
+#include <stdio.h>
+
+int main(void) {
+    int a[5] = {1, 2, 3};
+    int *p = a;
+    printf("%d %d %d\n", *(p + 2), a[2], 2 [a]);
+    printf("%td\n", &a[4] - &a[1]);
+    printf("%d\n", (a + 5) == &a[5]);
+    return 0;
+}
+```
+
+```text output
+3 3 3
+3
+1
+```
+
+## A two-dimensional array is row-major
+
+`int m[2][3]` is an array of two arrays of three ints, stored as one
+block. `sizeof m` is 6 ints, 24 bytes here.
+
+```c file=n05.c
+#include <stdio.h>
+
+int main(void) {
+    int m[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    int total = 0;
+    for (int r = 0; r < 2; r++) {
+        for (int c = 0; c < 3; c++) {
+            total += m[r][c];
+        }
+    }
+    printf("%d %d %zu\n", total, m[1][2], sizeof m);
+    return 0;
+}
+```
+
+```text output
+21 6 24
+```
+
+## qsort needs a three-way comparator
+
+The function receives `const void *` and returns negative, zero, or
+positive. Do not return `a - b`: that subtraction overflows for large
+ints. `(a > b) - (a < b)` does not.
+
+```c file=n06.c
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+static int cmp_int(const void *pa, const void *pb) {
+    int a = *(const int *)pa, b = *(const int *)pb;
+    return (a > b) - (a < b);
+}
+
+int main(void) {
+    int nums[] = {5, 2, 9, 1};
+    qsort(nums, 4, sizeof nums[0], cmp_int);
+    for (int i = 0; i < 4; i++) {
+        printf("%d%c", nums[i], i + 1 < 4 ? ' ' : '\n');
+    }
+    return 0;
+}
+```
+
+```text output
+1 2 5 9
+```
+
+## bsearch uses the same order
+
+The array must already be sorted with the comparator you pass.
+`hit - nums` is the index.
+
+```c file=n07.c
+#include <stdio.h>
+#include <stdlib.h>
+
+static int cmp_int(const void *pa, const void *pb) {
+    int a = *(const int *)pa, b = *(const int *)pb;
+    return (a > b) - (a < b);
+}
+
+int main(void) {
+    int nums[] = {1, 2, 5, 9};
+    int key = 5;
+    int *hit = bsearch(&key, nums, 4, sizeof nums[0], cmp_int);
+    printf("found at %td\n", hit - nums);
+    return 0;
+}
+```
+
+```text output
+found at 2
+```
+
+## The same comparator sorts structs
+
+Cast the `void *` back to the element type, then compare the field you
+care about. Ages differ, so the order does not depend on `qsort` being
+stable (it is not).
+
+```c file=n08.c
+#include <stdio.h>
+#include <stdlib.h>
 
 struct person {
     const char *name;
     int age;
 };
 
-/* Comparators for qsort take const void * and return <0, 0, >0 */
-static int cmp_int(const void *pa, const void *pb) {
-    int a = *(const int *)pa, b = *(const int *)pb;
-    return (a > b) - (a < b); /* never `a - b`: it can overflow */
-}
-
 static int cmp_age(const void *pa, const void *pb) {
     const struct person *a = pa, *b = pb;
     return (a->age > b->age) - (a->age < b->age);
 }
 
-/* A growable array, the C way */
+int main(void) {
+    struct person people[] = {{"Cy", 35}, {"Al", 30}, {"Bo", 25}};
+    qsort(people, 3, sizeof people[0], cmp_age);
+    for (int i = 0; i < 3; i++) {
+        printf("%s:%d ", people[i].name, people[i].age);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text output
+Bo:25 Al:30 Cy:35 
+```
+
+## Arrays cannot be assigned
+
+There is no `b = a`. `memcpy` copies the bytes; `memset` fills them.
+`a == b` compares the addresses of the two arrays, not the contents.
+`memcmp` compares bytes, but padding inside a struct is indeterminate, so
+do not use it on structs.
+
+```c file=n09.c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    int a[5] = {1, 2, 3};
+    int b[5];
+    int c[5] = {1, 2, 3, 0, 0};
+    const int *pa = a, *pc = c;
+    memcpy(b, a, sizeof b);
+    for (int i = 0; i < 5; i++) {
+        printf("%d ", b[i]);
+    }
+    printf("\n");
+    printf("%d %d\n", pa == pc, memcmp(a, c, sizeof a) == 0);
+    memset(b, 0, sizeof b);
+    for (int i = 0; i < 5; i++) {
+        printf("%d ", b[i]);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+```text output
+1 2 3 0 0 
+0 1
+0 0 0 0 0 
+```
+
+## realloc may move the block
+
+On growth, assign the result to a temporary. Failure returns `NULL` and
+leaves the old block valid; `p = realloc(p, n)` would leak it. This
+vector doubles from 4, so ten pushes end at length 10 and capacity 16.
+
+```c file=n10.c
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 struct intvec {
     int *data;
     size_t len, cap;
@@ -39,7 +278,7 @@ static int intvec_push(struct intvec *v, int x) {
         size_t ncap = v->cap ? v->cap * 2 : 4;
         int *p = realloc(v->data, ncap * sizeof *p);
         if (!p) {
-            return -1; /* old block is still valid and still owned */
+            return -1;
         }
         v->data = p;
         v->cap = ncap;
@@ -49,65 +288,6 @@ static int intvec_push(struct intvec *v, int x) {
 }
 
 int main(void) {
-    int a[5] = {1, 2, 3}; /* the rest is zero-filled */
-    for (size_t i = 0; i < ARRAY_LEN(a); i++) {
-        printf("%d ", a[i]);
-    }
-    printf("\n");
-
-    int sparse[6] = {[1] = 10, [4] = 40}; /* designated initialisers */
-    for (size_t i = 0; i < ARRAY_LEN(sparse); i++) {
-        printf("%d ", sparse[i]);
-    }
-    printf("\n");
-    printf("%zu\n", ARRAY_LEN(a));
-
-    /* a[i] is *(a + i) */
-    int *p = a;
-    printf("%d %d %d\n", *(p + 2), a[2], 2 [a]);
-    printf("%td\n", &a[4] - &a[1]); /* pointer difference is in elements */
-
-    /* 2-D arrays are arrays of arrays, stored row-major */
-    int m[2][3] = {{1, 2, 3}, {4, 5, 6}};
-    int total = 0;
-    for (int r = 0; r < 2; r++) {
-        for (int c = 0; c < 3; c++) {
-            total += m[r][c];
-        }
-    }
-    printf("%d %d %zu\n", total, m[1][2], sizeof m);
-
-    /* qsort and bsearch */
-    int nums[] = {5, 2, 9, 1};
-    qsort(nums, ARRAY_LEN(nums), sizeof nums[0], cmp_int);
-    for (size_t i = 0; i < ARRAY_LEN(nums); i++) {
-        printf("%d%c", nums[i], i + 1 < ARRAY_LEN(nums) ? ' ' : '\n');
-    }
-    int key = 5;
-    int *hit = bsearch(&key, nums, ARRAY_LEN(nums), sizeof nums[0], cmp_int);
-    printf("found at %td\n", hit - nums);
-
-    struct person people[] = {{"Cy", 35}, {"Al", 30}, {"Bo", 25}};
-    qsort(people, ARRAY_LEN(people), sizeof people[0], cmp_age);
-    for (size_t i = 0; i < ARRAY_LEN(people); i++) {
-        printf("%s:%d ", people[i].name, people[i].age);
-    }
-    printf("\n");
-
-    /* Arrays cannot be assigned: use memcpy / memset */
-    int b[5];
-    memcpy(b, a, sizeof b);
-    for (size_t i = 0; i < ARRAY_LEN(b); i++) {
-        printf("%d ", b[i]);
-    }
-    printf("\n");
-    memset(b, 0, sizeof b);
-    for (size_t i = 0; i < ARRAY_LEN(b); i++) {
-        printf("%d ", b[i]);
-    }
-    printf("\n");
-
-    /* Dynamic array */
     struct intvec v = {0};
     for (int i = 0; i < 10; i++) {
         if (intvec_push(&v, i) != 0) {
@@ -121,38 +301,9 @@ int main(void) {
 ```
 
 ```text output
-1 2 3 0 0 
-0 10 0 0 40 0 
-5
-3 3 3
-3
-21 6 24
-1 2 5 9
-found at 2
-Bo:25 Al:30 Cy:35 
-1 2 3 0 0 
-0 0 0 0 0 
 len=10 cap=16 last=9
 ```
 
-## Details that bite
-
-- **No bounds checking.** Reading or writing `a[5]` on a 5-element array is
-  undefined behaviour: it may crash, corrupt memory, or seem to work.
-  Build with `-fsanitize=address` to catch it.
-- `sizeof a / sizeof a[0]` works only where `a` is a real array, not a
-  parameter or a `malloc`ed pointer.
-- `a == b` on arrays compares *addresses*, not contents; use `memcmp`
-  (but beware padding bytes inside structs).
-- A comparator that returns `a - b` overflows for large values. Use
-  `(a > b) - (a < b)`.
-- Always assign `realloc`'s result to a temporary: on failure it returns
-  `NULL` and the old block is still yours (and must still be freed).
-- A pointer may legally point one past the end of an array but must not be
-  dereferenced.
-- Avoid variable-length arrays (`int a[n]`) for untrusted sizes: a large
-  `n` overflows the stack. Use `malloc`.
-- Off-by-one errors: an array of N elements has indexes `0 … N-1`.
 
 ## Exercises
 

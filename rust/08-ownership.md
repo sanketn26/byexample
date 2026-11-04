@@ -1,16 +1,123 @@
 # Rust 08 — Ownership, Borrowing and Lifetimes
 
-This is Rust's defining idea. Every value has exactly one owner; when the
-owner goes out of scope the value is dropped. References borrow without
-owning, and the compiler proves at compile time that no reference outlives
-its data or aliases a mutation.
+Every value has one owner. When that owner goes out of scope, the value is
+dropped. A reference borrows without owning. The compiler rejects a
+reference that outlives its data, and it rejects a mutation that aliases a
+shared borrow. You rearrange the code when the checker says no: smaller
+scopes, an index instead of a pointer, a cheap clone, or a split struct.
 
-## Example
+## A move transfers the single owner
 
-```rust file=example.rs
-use std::cell::RefCell;
-use std::rc::Rc;
+Passing a `String`, or any non-`Copy` value, moves it. The old name is
+illegal after that. Lend with `&value`, or call `.clone()` when you really
+need a second owner. You cannot return a reference to a local variable.
+Return the owned value instead.
 
+```rust file=n01.rs
+fn main() {
+    let s1 = String::from("hello");
+    let s2 = s1;
+    println!("{s2}");
+}
+```
+
+```text output
+hello
+```
+
+## `clone` is an explicit deep copy
+
+`clone` on a `String` allocates another buffer. Both names remain valid.
+That is the point of writing it out.
+
+```rust file=n02.rs
+fn main() {
+    let s2 = String::from("hello");
+    let s3 = s2.clone();
+    println!("{s2} {s3}");
+}
+```
+
+```text output
+hello hello
+```
+
+## `Copy` types are duplicated by assignment
+
+Integers, `bool`, `char`, and shared references are `Copy`. Assignment
+copies the bits. The original name still works, and there is no `.clone()`
+to write.
+
+```rust file=n03.rs
+fn main() {
+    let x = 5;
+    let y = x;
+    println!("{x} {y}");
+}
+```
+
+```text output
+5 5
+```
+
+## A borrow lets a function use the value
+
+`len` takes `&String` and returns the length. `append` takes `&mut String`
+and changes the same buffer. After either call, the owner still owns it.
+
+```rust file=n04.rs
+fn len(s: &String) -> usize {
+    s.len()
+}
+
+fn append(s: &mut String) {
+    s.push('!');
+}
+
+fn main() {
+    let mut s = String::from("hi");
+    println!("{}", len(&s));
+    append(&mut s);
+    println!("{s}");
+}
+```
+
+```text output
+2
+hi!
+```
+
+## Many readers, or one writer
+
+You may hold several shared borrows, or one mutable borrow, not both at
+once. The checker looks at uses, not at the braces (non-lexical lifetimes).
+A borrow ends at its last use, so the mutable borrow below is legal.
+
+```rust file=n05.rs
+fn main() {
+    let mut s = String::from("hi!");
+    let r1 = &s;
+    let r2 = &s;
+    println!("{r1} {r2}");
+    let r3 = &mut s;
+    r3.push('?');
+    println!("{r3}");
+}
+```
+
+```text output
+hi! hi!
+hi!?
+```
+
+## `Drop` runs in reverse order of declaration
+
+The value is dropped at the end of the scope, including on `return` and
+while a panic unwinds. That is how locks, files, and sockets clean up.
+`drop(n)` does it now. The parameter of `takes` owns the value, so the drop
+happens when `takes` returns.
+
+```rust file=n06.rs
 struct Noisy(&'static str);
 
 impl Drop for Noisy {
@@ -23,15 +130,37 @@ fn takes(n: Noisy) {
     println!("took {}", n.0);
 }
 
-fn len(s: &String) -> usize {
-    s.len()
+fn main() {
+    {
+        let _a = Noisy("a");
+        let _b = Noisy("b");
+        println!("scope end");
+    }
+    takes(Noisy("moved"));
+    let n = Noisy("kept");
+    drop(n);
+    println!("after drop");
 }
+```
 
-fn append(s: &mut String) {
-    s.push('!');
-}
+```text output
+scope end
+drop b
+drop a
+took moved
+drop moved
+drop kept
+after drop
+```
 
-// The 'a says: the result lives no longer than BOTH inputs
+## A lifetime says how two borrows relate
+
+`'a` on `longest` means the returned reference lives no longer than both
+inputs. The annotation does not extend anyone's life. It tells the compiler
+the relationship it has to check. A struct that stores a reference names
+the same relationship.
+
+```rust file=n07.rs
 fn longest<'a>(a: &'a str, b: &'a str) -> &'a str {
     if a.len() >= b.len() {
         a
@@ -40,7 +169,6 @@ fn longest<'a>(a: &'a str, b: &'a str) -> &'a str {
     }
 }
 
-// A struct that borrows must say how long
 struct Parser<'a> {
     input: &'a str,
 }
@@ -51,6 +179,45 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn main() {
+    println!("{}", longest("apple", "fig"));
+    let p = Parser { input: "hello world" };
+    println!("{}", p.first_word());
+}
+```
+
+```text output
+apple
+hello
+```
+
+## `swap` and `take` move through a mutable borrow
+
+`mem::swap` exchanges two values. `mem::take` moves a value out and leaves
+`Default::default()` behind, which for a `Vec` is empty. Neither one clones.
+
+```rust file=n08.rs
+fn main() {
+    let mut a = vec![1, 2];
+    let mut b = vec![3];
+    std::mem::swap(&mut a, &mut b);
+    println!("{a:?} {b:?}");
+    let taken = std::mem::take(&mut a);
+    println!("{taken:?} {a:?}");
+}
+```
+
+```text output
+[3] [1, 2]
+[3] []
+```
+
+## `Box` puts one value on the heap
+
+A recursive enum would otherwise contain itself. The `Box` makes the size
+finite. Dereference with `*`.
+
+```rust file=n09.rs
 enum List {
     Cons(i32, Box<List>),
     Nil,
@@ -64,118 +231,72 @@ fn sum(list: &List) -> i32 {
 }
 
 fn main() {
-    // Move: s1 is no longer usable
-    let s1 = String::from("hello");
-    let s2 = s1;
-    println!("{s2}");
-
-    // Clone: an explicit deep copy
-    let s3 = s2.clone();
-    println!("{s2} {s3}");
-
-    // Copy types (integers, bool, char, ...) are duplicated implicitly
-    let x = 5;
-    let y = x;
-    println!("{x} {y}");
-
-    // Borrowing
-    let mut s = String::from("hi");
-    println!("{}", len(&s));
-    append(&mut s);
-    println!("{s}");
-
-    // Many shared borrows OR one mutable borrow, never both at once
-    let r1 = &s;
-    let r2 = &s;
-    println!("{r1} {r2}");
-    let r3 = &mut s; // fine: r1 and r2 are no longer used
-    r3.push('?');
-    println!("{r3}");
-
-    // Drop order: reverse of declaration
-    {
-        let _a = Noisy("a");
-        let _b = Noisy("b");
-        println!("scope end");
-    }
-    takes(Noisy("moved"));
-    let n = Noisy("kept");
-    drop(n);
-    println!("after drop");
-
-    // Lifetimes
-    println!("{}", longest("apple", "fig"));
-    let p = Parser { input: "hello world" };
-    let w = p.first_word();
-    println!("{w}");
-
-    // std::mem helpers swap values without clone
-    let mut a = vec![1, 2];
-    let mut b = vec![3];
-    std::mem::swap(&mut a, &mut b);
-    println!("{a:?} {b:?}");
-    let taken = std::mem::take(&mut a);
-    println!("{taken:?} {a:?}");
-
-    // Heap allocation and shared ownership
     let boxed = Box::new(5);
     println!("{}", *boxed + 1);
-
-    let shared = Rc::new(RefCell::new(vec![1]));
-    let other = Rc::clone(&shared);
-    other.borrow_mut().push(2);
-    println!("{:?} {}", shared.borrow(), Rc::strong_count(&shared));
-
     let list = List::Cons(1, Box::new(List::Cons(2, Box::new(List::Nil))));
     println!("{}", sum(&list));
 }
 ```
 
 ```text output
-hello
-hello hello
-5 5
-2
-hi!
-hi! hi!
-hi!?
-scope end
-drop b
-drop a
-took moved
-drop moved
-drop kept
-after drop
-apple
-hello
-[3] [1, 2]
-[3] []
 6
-[1, 2] 2
 3
 ```
 
-## Details that bite
+## `Rc` shares ownership on one thread
 
-- Passing a `String` (or any non-`Copy` value) to a function **moves** it;
-  you cannot use it afterwards. Pass `&value` to lend it, or `.clone()` to
-  duplicate it.
-- The borrow checker reasons about *uses*, not scopes (non-lexical
-  lifetimes): a borrow ends after its last use.
-- You cannot return a reference to a local variable; return the owned
-  value instead.
-- `Rc<T>` is single-threaded shared ownership (use `Arc<T>` across
-  threads), and `RefCell<T>` moves borrow checking to runtime: breaking the
-  rules panics (`already borrowed`). Reach for them only when the static
-  rules truly cannot express your design.
-- `Rc` cycles leak; break them with `Weak`.
-- `Drop` runs at scope end in reverse order, even on early `return` or
-  panic unwinding. That is how locks, files and sockets clean up (RAII).
-- Lifetime annotations do not change how long values live; they describe
-  relationships so the compiler can verify them.
-- "Fighting the borrow checker" usually means restructuring: split a
-  struct, clone cheaply, store indexes instead of references, or use
-  smaller scopes.
+`Rc::clone` increments a count. It does not clone the vector. `RefCell`
+moves the borrow check to runtime: two mutable borrows panic with "already
+borrowed". Use these only when the static rules cannot express the design.
+Across threads the pair is `Arc` and `Mutex` (lesson 11), because `Rc` and
+`RefCell` are not `Send` or `Sync`.
+
+```rust file=n10.rs
+use std::cell::RefCell;
+use std::rc::Rc;
+
+fn main() {
+    let shared = Rc::new(RefCell::new(vec![1]));
+    let other = Rc::clone(&shared);
+    other.borrow_mut().push(2);
+    println!("{:?} {}", shared.borrow(), Rc::strong_count(&shared));
+
+    std::panic::set_hook(Box::new(|_| {}));
+    let cell = RefCell::new(1);
+    let _guard = cell.borrow();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = cell.borrow_mut();
+    }));
+    println!("{}", panicked.is_err());
+}
+```
+
+```text output
+[1, 2] 2
+true
+```
+
+## `Weak` does not keep the value alive
+
+An `Rc` cycle never reaches zero, so it leaks. Store a `Weak` for the back
+edge. `upgrade` returns `None` once the last strong pointer is gone.
+
+```rust file=n11.rs
+use std::rc::{Rc, Weak};
+
+fn main() {
+    let a = Rc::new(1);
+    let w: Weak<i32> = Rc::downgrade(&a);
+    println!("{}", w.upgrade().is_some());
+    drop(a);
+    println!("{}", w.upgrade().is_none());
+}
+```
+
+```text output
+true
+true
+```
 
 ## Exercises
 

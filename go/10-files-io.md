@@ -1,26 +1,203 @@
 # Go 10 — Files, I/O and the Standard Library
 
 `io.Reader` and `io.Writer` are the universal plumbing. Files, network
-connections, buffers and compressors all speak them.
+connections, buffers, and compressors all speak them. `os.ReadFile` loads
+the whole file; stream a large one with `io.Copy`. Use `filepath` for OS
+paths and `path` for slash-separated paths such as URLs. `exec.Command`
+does not run a shell, so pass arguments separately and the call stays free
+of injection.
 
-## Example
+## Read and write a whole small file
 
-```go file=example.go
+`WriteFile` and `ReadFile` are the short path. Every `os.Open` still needs
+a `Close`. Defer it immediately after you know the open succeeded, and
+check the error from `Close` on a file you wrote: that is sometimes where
+the failure shows up.
+
+```go file=n01.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		panic(err)
+	}
+	data, err := os.ReadFile(notes)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(strings.Split(strings.TrimSpace(string(data)), "\n"))
+}
+```
+
+```text output
+[alpha beta gamma]
+```
+
+## A scanner walks one line at a time
+
+`Scan` strips the newline. The default token limit is 64 KiB; call
+`sc.Buffer` for longer lines. `sc.Err()` is the I/O error, distinct from
+a clean end of file.
+
+```go file=n02.go
 package main
 
 import (
 	"bufio"
-	"encoding/csv"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"reflect"
-	"strconv"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		panic(err)
+	}
+	f, err := os.Open(notes)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for line := 1; sc.Scan(); line++ {
+		fmt.Println(line, sc.Text())
+	}
+	fmt.Println(sc.Err())
+}
+```
+
+```text output
+1 alpha
+2 beta
+3 gamma
+<nil>
+```
+
+## A buffered writer holds bytes until `Flush`
+
+`bufio.Writer` does not touch the file on every `WriteString`. `Flush`
+pushes the buffer. Skip it and the last lines never land.
+
+```go file=n03.go
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	notes := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(notes, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		panic(err)
+	}
+	f, err := os.OpenFile(notes, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		panic(err)
+	}
+	w := bufio.NewWriter(f)
+	if _, err := w.WriteString("delta\n"); err != nil {
+		panic(err)
+	}
+	if err := w.Flush(); err != nil {
+		panic(err)
+	}
+	if err := f.Close(); err != nil {
+		panic(err)
+	}
+	data, err := os.ReadFile(notes)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(strings.Count(string(data), "\n"))
+}
+```
+
+```text output
+4
+```
+
+## A binary file is a slice of bytes
+
+There is no separate binary mode. `Stat` reports the size the kernel sees,
+which matches the slice you wrote.
+
+```go file=n04.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	bin := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(bin, []byte{0, 1, 2, 255}, 0o600); err != nil {
+		panic(err)
+	}
+	raw, err := os.ReadFile(bin)
+	if err != nil {
+		panic(err)
+	}
+	st, err := os.Stat(bin)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(raw, st.Size())
+}
+```
+
+```text output
+[0 1 2 255] 4
+```
+
+## Struct tags control JSON field names
+
+Exported fields are encoded. `extra` is a nil pointer, so it becomes
+`null`. `debug` is present because the tag has no `omitempty`. Unexported
+fields are ignored.
+
+```go file=n05.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"reflect"
 )
 
 type Config struct {
@@ -30,149 +207,270 @@ type Config struct {
 	Extra *string `json:"extra"`
 }
 
-func must(err error) {
+func main() {
+	cfg := Config{Name: "app", Ports: []int{80, 443}}
+	js, err := json.Marshal(cfg)
 	if err != nil {
 		panic(err)
 	}
-}
-
-func main() {
-	dir, err := os.MkdirTemp("", "gobyexample")
-	must(err)
-	defer os.RemoveAll(dir)
-
-	// Whole-file helpers
-	notes := filepath.Join(dir, "notes.txt")
-	must(os.WriteFile(notes, []byte("alpha\nbeta\ngamma\n"), 0o644))
-	data, err := os.ReadFile(notes)
-	must(err)
-	fmt.Println(strings.Split(strings.TrimSpace(string(data)), "\n"))
-
-	// Streaming line by line
-	f, err := os.Open(notes)
-	must(err)
-	sc := bufio.NewScanner(f)
-	for line := 1; sc.Scan(); line++ {
-		fmt.Println(line, sc.Text())
-	}
-	f.Close()
-
-	// Appending; defer Close right after a successful open
-	func() {
-		f, err := os.OpenFile(notes, os.O_APPEND|os.O_WRONLY, 0o644)
-		must(err)
-		defer f.Close()
-		w := bufio.NewWriter(f)
-		w.WriteString("delta\n")
-		must(w.Flush()) // buffered writers must be flushed
-	}()
-	data, _ = os.ReadFile(notes)
-	fmt.Println(strings.Count(string(data), "\n"))
-
-	// Binary
-	bin := filepath.Join(dir, "data.bin")
-	must(os.WriteFile(bin, []byte{0, 1, 2, 255}, 0o600))
-	raw, _ := os.ReadFile(bin)
-	st, _ := os.Stat(bin)
-	fmt.Println(raw, st.Size())
-
-	// JSON round trip
-	cfg := Config{Name: "app", Ports: []int{80, 443}}
-	js, _ := json.Marshal(cfg)
 	var back Config
-	must(json.Unmarshal(js, &back))
+	if err := json.Unmarshal(js, &back); err != nil {
+		panic(err)
+	}
 	fmt.Println(reflect.DeepEqual(cfg, back))
 	fmt.Println(string(js))
-
-	// Decoding into any: numbers become float64
-	var generic map[string]any
-	must(json.Unmarshal(js, &generic))
-	fmt.Printf("%T\n", generic["ports"].([]any)[0])
-
-	// CSV quotes fields that contain commas
-	csvPath := filepath.Join(dir, "people.csv")
-	cf, _ := os.Create(csvPath)
-	cw := csv.NewWriter(cf)
-	cw.WriteAll([][]string{{"name", "age"}, {"Ada", "36"}, {"Linus, T.", "55"}})
-	cf.Close()
-	text, _ := os.ReadFile(csvPath)
-	fmt.Println(strings.Split(string(text), "\n")[2])
-
-	cf, _ = os.Open(csvPath)
-	rows, _ := csv.NewReader(cf).ReadAll()
-	cf.Close()
-	total := 0
-	for _, r := range rows[1:] {
-		n, _ := strconv.Atoi(r[1])
-		total += n
-	}
-	fmt.Println(rows[2][0], total)
-
-	// Walking a tree
-	must(os.Mkdir(filepath.Join(dir, "sub"), 0o755))
-	must(os.WriteFile(filepath.Join(dir, "sub", "x.go"), []byte("package x"), 0o644))
-	must(os.WriteFile(filepath.Join(dir, "cfg.json"), js, 0o644))
-	var files []string
-	must(filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() {
-			rel, _ := filepath.Rel(dir, p)
-			files = append(files, filepath.ToSlash(rel))
-		}
-		return nil
-	}))
-	fmt.Println(files)
-
-	// Missing file
-	_, err = os.ReadFile(filepath.Join(dir, "nope"))
-	fmt.Println(errors.Is(err, fs.ErrNotExist))
-
-	// Subprocess
-	out, err := exec.Command("echo", "42").Output()
-	must(err)
-	fmt.Println(strings.TrimSpace(string(out)))
-
-	// Environment
-	v, ok := os.LookupEnv("DEFINITELY_NOT_SET")
-	fmt.Printf("%q %v\n", v, ok)
-	fmt.Fprintln(os.Stderr, "to stderr")
 }
 ```
 
 ```text output
-[alpha beta gamma]
-1 alpha
-2 beta
-3 gamma
-4
-[0 1 2 255] 4
 true
 {"name":"app","ports":[80,443],"debug":false,"extra":null}
-float64
-"Linus, T.",55
-Linus, T. 91
-[cfg.json data.bin notes.txt people.csv sub/x.go]
-true
-42
-"" false
 ```
 
-## Details that bite
+## JSON numbers become `float64` in `any`
 
-- Every `os.Open` needs a `Close`. `defer f.Close()` right after checking
-  the error. For *writes*, check the `Close` error too — it can be where
-  the failure shows up.
-- `bufio.Scanner` has a 64 KiB line limit by default; use
-  `sc.Buffer(...)` for long lines and check `sc.Err()`.
-- `bufio.Writer` holds data until `Flush`.
-- `json` ignores unexported fields, and decodes numbers into `float64` when
-  the target is `any`. Use `json.Decoder.UseNumber` for exact integers.
-- `os.ReadFile` loads everything; stream with `io.Copy` for large files.
-- Use `filepath` for OS paths and `path` for slash-paths (URLs).
-- `exec.Command` does not use a shell; pass arguments separately. That is
-  what makes it safe from injection.
+A `map[string]any` has nowhere to put an integer type, so the decoder uses
+`float64`. `json.Decoder.UseNumber` keeps the digits exact when that
+matters.
+
+```go file=n06.go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+func main() {
+	js := []byte(`{"ports":[80,443]}`)
+	var generic map[string]any
+	if err := json.Unmarshal(js, &generic); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%T\n", generic["ports"].([]any)[0])
+}
+```
+
+```text output
+float64
+```
+
+## CSV quotes a field that contains a comma
+
+`WriteAll` flushes. The reader returns the unquoted field, so the comma
+inside the name is data, not a separator.
+
+```go file=n07.go
+package main
+
+import (
+	"encoding/csv"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	csvPath := filepath.Join(dir, "people.csv")
+	cf, err := os.Create(csvPath)
+	if err != nil {
+		panic(err)
+	}
+	cw := csv.NewWriter(cf)
+	if err := cw.WriteAll([][]string{{"name", "age"}, {"Ada", "36"}, {"Linus, T.", "55"}}); err != nil {
+		panic(err)
+	}
+	if err := cf.Close(); err != nil {
+		panic(err)
+	}
+	text, err := os.ReadFile(csvPath)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(strings.Split(string(text), "\n")[2])
+
+	cf, err = os.Open(csvPath)
+	if err != nil {
+		panic(err)
+	}
+	rows, err := csv.NewReader(cf).ReadAll()
+	cf.Close()
+	if err != nil {
+		panic(err)
+	}
+	total := 0
+	for _, r := range rows[1:] {
+		n, err := strconv.Atoi(r[1])
+		if err != nil {
+			panic(err)
+		}
+		total += n
+	}
+	fmt.Println(rows[2][0], total)
+}
+```
+
+```text output
+"Linus, T.",55
+Linus, T. 91
+```
+
+## `WalkDir` visits names in lexical order
+
+The callback sees every file and directory. Skip directories when you want
+only files, and use `filepath.ToSlash` so the printed relative path does
+not depend on the OS separator. The order is sorted, not the order of
+`Create`.
+
+```go file=n08.go
+package main
+
+import (
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("n"), 0o644); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data.bin"), []byte{1}, 0o600); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "people.csv"), []byte("a"), 0o644); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cfg.json"), []byte(`{"name":"app"}`), 0o644); err != nil {
+		panic(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "x.go"), []byte("package x"), 0o644); err != nil {
+		panic(err)
+	}
+	var files []string
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			rel, err := filepath.Rel(dir, p)
+			if err != nil {
+				return err
+			}
+			files = append(files, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(files)
+}
+```
+
+```text output
+[cfg.json data.bin notes.txt people.csv sub/x.go]
+```
+
+## A missing file is `fs.ErrNotExist`
+
+`os.IsNotExist` answers the same question. `errors.Is` is the form that
+still works when the error is wrapped.
+
+```go file=n09.go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "gobyexample")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	_, err = os.ReadFile(filepath.Join(dir, "nope"))
+	fmt.Println(errors.Is(err, fs.ErrNotExist))
+}
+```
+
+```text output
+true
+```
+
+## `exec.Command` takes the program and its arguments
+
+`Output` runs `echo` with the argument `42`. No shell sees the string, so
+spaces and metacharacters stay data.
+
+```go file=n10.go
+package main
+
+import (
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+func main() {
+	out, err := exec.Command("echo", "42").Output()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(strings.TrimSpace(string(out)))
+}
+```
+
+```text output
+42
+```
+
+## Standard error is a different stream
+
+`fmt.Fprintln(os.Stderr, ...)` does not appear below; this page records
+standard output only. `LookupEnv` reports a missing variable as `""` and
+false, which is not the same as a variable set to empty (`os.Getenv`
+cannot tell those apart).
+
+```go file=n11.go
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Fprintln(os.Stderr, "to stderr")
+	v, ok := os.LookupEnv("DEFINITELY_NOT_SET")
+	fmt.Printf("%q %v\n", v, ok)
+}
+```
+
+```text output
+"" false
+```
 
 ## Exercises
 

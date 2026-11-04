@@ -1,81 +1,160 @@
 # Python 01 — Values, Variables and Printing
 
-Everything in Python is an object, and a variable is just a *name* bound to an
-object. You never declare a type; the object carries it.
+Everything in Python is an object, and a variable is a name bound to an
+object. You never declare a type; the object carries it. There are no
+constants: `MAX = 10` is a convention, and a later assignment replaces it.
 
-## Example
+## Integers do not overflow
 
-```python file=example.py
-# Numbers
-count = 42            # int: unlimited precision
-price = 9.99          # float: 64-bit IEEE 754
-ratio = 3 / 2         # true division always gives a float
-floor = 7 // 2        # floor division
-rem = 7 % 3           # remainder
-power = 2 ** 100      # ints never overflow
+`int` grows until memory runs out. `**` is exponentiation.
 
-print(count, price, ratio, floor, rem)
+```python file=n01.py
+count = 42
+power = 2 ** 100
+print(count)
 print(power)
+```
 
-# Floats are binary, so decimal fractions are approximate
+```text output
+42
+1267650600228229401496703205376
+```
+
+## Division has two operators
+
+`/` always returns a float. `//` and `%` floor toward negative infinity, so
+`-7 // 2` is `-4` and `-7 % 3` is `2`.
+
+```python file=n02.py
+print(3 / 2)
+print(7 // 2, 7 % 3)
+print(-7 // 2, -7 % 3)
+```
+
+```text output
+1.5
+3 1
+-4 2
+```
+
+## Decimal fractions are approximate
+
+`0.1 + 0.2` is not `0.3`, because floats are binary. Use `math.isclose` or
+the `decimal` module when the exact decimal matters.
+
+```python file=n03.py
 print(0.1 + 0.2)
 print(0.1 + 0.2 == 0.3)
+```
 
-# Booleans, None, and truthiness
+```text output
+0.30000000000000004
+False
+```
+
+## Most values are truthy
+
+Only `0`, `0.0`, `""`, `[]`, `{}`, `set()`, `()`, `None`, and `False` are
+falsy. The string `"0"` is truthy. `None` means "no value".
+
+```python file=n04.py
 flag = True
 nothing = None
 print(flag and not nothing)
 print(bool(0), bool(""), bool([]), bool("0"), bool([0]))
+```
 
-# Inspecting types
+```text output
+True
+False False False True True
+```
+
+## The object carries the type
+
+`type` reports the class. `bool` is a subclass of `int`, so `True + True`
+is `2`. `isinstance` follows that relationship; `type(True) is int` does not.
+
+```python file=n05.py
+count = 42
+price = 9.99
+flag = True
+nothing = None
 print(type(count), type(price), type(flag), type(nothing))
-print(isinstance(True, int))      # bool is a subclass of int
+print(isinstance(True, int))
+print(True + True)
+```
 
-# Multiple assignment, swapping, and unpacking
+```text output
+<class 'int'> <class 'float'> <class 'bool'> <class 'NoneType'>
+True
+2
+```
+
+## `is` tests identity, `==` tests equality
+
+Two equal lists are not the same object. Use `is` for `None` (`x is None`)
+and for nothing else you care about comparing by value.
+
+```python file=n06.py
+print(None is None)
+print([] == [])
+print([] is [])
+```
+
+```text output
+True
+True
+False
+```
+
+## One assignment can bind several names
+
+The right-hand side is evaluated first, which is why a swap needs no
+temporary. A starred name collects whatever is left.
+
+```python file=n07.py
 a, b = 1, 2
 a, b = b, a
 first, *rest = [10, 20, 30]
 print(a, b, first, rest)
+```
 
-# Formatting: f-strings are the default tool
+```text output
+2 1 10 [20, 30]
+```
+
+## f-strings format in place
+
+The format spec after `:` does the work of `printf`. `!r` calls `repr`.
+Underscores in a numeric literal are ignored.
+
+```python file=n08.py
 name = "Ada"
+count = 42
+price = 9.99
+power = 2 ** 100
 print(f"{name} has {count} items costing {price:.1f} each")
 print(f"{count:05d} | {price:>8.2f} | {power:.3e} | {255:#x}")
 print(f"{name!r} {1_000_000:,}")
+```
 
-# print() options
+```text output
+Ada has 42 items costing 10.0 each
+00042 |     9.99 | 1.268e+30 | 0xff
+'Ada' 1,000,000
+```
+
+## `print` joins its arguments
+
+`sep` goes between arguments. `end` replaces the trailing newline.
+
+```python file=n09.py
 print("a", "b", "c", sep="-", end="!\n")
 ```
 
 ```text output
-42 9.99 1.5 3 1
-1267650600228229401496703205376
-0.30000000000000004
-False
-True
-False False False True True
-<class 'int'> <class 'float'> <class 'bool'> <class 'NoneType'>
-True
-2 1 10 [20, 30]
-Ada has 42 items costing 10.0 each
-00042 |     9.99 | 1.268e+30 | 0xff
-'Ada' 1,000,000
 a-b-c!
 ```
-
-## Details that bite
-
-- `/` is always float division; use `//` for integers. `-7 // 2` is `-4`
-  (floors toward negative infinity), and `%` follows the same rule, so
-  `-7 % 3 == 2`.
-- `0.1 + 0.2 != 0.3`. Use `math.isclose(a, b)` or the `decimal` module for
-  money.
-- Only `0`, `0.0`, `""`, `[]`, `{}`, `set()`, `()`, `None` and `False` are
-  falsy. The string `"0"` is **truthy**.
-- `is` tests identity, `==` tests equality. Use `is` only for `None`
-  (`x is None`).
-- `bool` is a subclass of `int`: `True + True == 2`.
-- Python has no constants. `MAX = 10` is a convention, not enforcement.
 
 ## Exercises
 

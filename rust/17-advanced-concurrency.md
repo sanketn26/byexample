@@ -1,15 +1,25 @@
 # Rust 17 — Advanced concurrency
 
-A thread per request, with nothing to stop it and nowhere for work to queue, fails by exhausting memory. Bound the workers, bound the channel, put a deadline on the wait, and make shutdown something the workers can see. This is the shape of a server in front of the sockets from the previous lesson. Tokio's runtime is the same shape with a different scheduler.
+A thread per request, with nothing to stop it and nowhere for work to
+queue, fails by exhausting memory or file descriptors. Bound the workers.
+Bound the channel. Put a deadline on the wait. Make shutdown something the
+workers can see. This is the shape of a server in front of the sockets from
+the previous lesson. Tokio's runtime is the same shape with a different
+scheduler. It does not remove the bound, the deadline, or the shutdown.
+Join the workers before the process exits.
 
-## Example
+## The pool's high-water mark is the bound
 
-```rust file=example.rs
+Two workers run, and the queue holds the rest. The gate keeps the first
+wave inside the job until that many have entered, so `max` does not depend
+on the scheduler. `max` is the number you have to be able to explain: it is
+how many jobs are in progress at once.
+
+```rust file=n01.rs
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 fn run_pool(workers: usize, jobs: &[i32]) -> (Vec<i32>, usize) {
     let n = jobs.len();
@@ -78,13 +88,49 @@ fn run_pool(workers: usize, jobs: &[i32]) -> (Vec<i32>, usize) {
 fn main() {
     let (results, max_in) = run_pool(2, &[0, 1, 2, 3]);
     println!("pool {results:?} {max_in}");
+}
+```
 
+```text output
+pool [0, 1, 4, 9] 2
+```
+
+## A deadline covers the whole wait
+
+`recv_timeout` fails when the duration is up. A 150 millisecond read
+timeout inside a transfer that retries forever is not a deadline. The
+budget has to include every retry. `context` in other languages, and
+`poll`, are the same idea.
+
+```rust file=n02.rs
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+fn main() {
     let (_tx, rx) = mpsc::channel::<i32>();
     match rx.recv_timeout(Duration::from_millis(30)) {
         Err(RecvTimeoutError::Timeout) => println!("deadline"),
         other => println!("unexpected {other:?}"),
     }
+}
+```
 
+```text output
+deadline
+```
+
+## `try_send` is backpressure
+
+A `sync_channel(2)` holds two values. The third `try_send` fails
+immediately. The producer hears about it on this thread. A blocking send
+would hide the problem on a thread you may not be able to spare.
+`put_nowait`, a `select` with a default, and a ring that refuses the next
+push are the same signal.
+
+```rust file=n03.rs
+use std::sync::mpsc;
+
+fn main() {
     let (tx, _rx) = mpsc::sync_channel(2);
     let mut accepted = 0;
     for i in 0..5 {
@@ -95,7 +141,28 @@ fn main() {
         }
     }
     println!("accepted {accepted}");
+}
+```
 
+```text output
+accepted 2
+```
+
+## Shutdown is cooperative
+
+The workers are alive, then told to stop. Setting the flag does nothing to
+a worker blocked in a syscall until that syscall is interruptible too:
+close the fd, or give the read its own deadline. These workers are blocked
+on a condition variable, which `notify_all` wakes. The four queued jobs
+stay queued (`stopped 4`) for the caller to drop or drain. Cancelling does
+not throw them away.
+
+```rust file=n04.rs
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::mpsc;
+use std::thread;
+
+fn main() {
     let (tx, rx) = mpsc::channel::<i32>();
     for i in 0..4 {
         tx.send(i).unwrap();
@@ -130,36 +197,8 @@ fn main() {
 ```
 
 ```text output
-pool [0, 1, 4, 9] 2
-deadline
-accepted 2
 stopped 4
 ```
-
-## Details that bite
-
-- Bound two numbers: how many workers run, and how many jobs sit in the
-  queue. One thread, goroutine or task per request, with no ceiling,
-  dies by running out of memory or file descriptors.
-- `max` in the pool output is the number you have to be able to explain.
-  The example holds the first wave of workers inside the job until that
-  many have entered, so the high-water mark is observable instead of
-  depending on the scheduler.
-- A full bounded channel (`put_nowait`, `select`/`default`, `try_send`,
-  a ring that refuses the next push) is backpressure. The producer hears
-  about it now. A blocking send hides the problem on a thread you may
-  not be able to spare.
-- A deadline covers the whole operation. A 150ms read timeout inside a
-  transfer that retries forever is not one. `context`, `recv_timeout`
-  and `poll` are the same idea.
-- Cancellation is cooperative. Cancelling a context or setting a flag
-  does nothing to a worker blocked in a syscall until that syscall is
-  also interruptible: close the fd, or give the read its own deadline.
-  The example's workers are alive, then told to stop, and the four
-  queued jobs stay queued (`stopped 4`) for the caller to drop or drain.
-- Join the workers before the process exits. Rust async runtimes add a
-  scheduler under this shape; they do not remove the bound, the deadline
-  or the shutdown.
 
 ## Exercises
 

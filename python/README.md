@@ -1,6 +1,7 @@
 # Python by Example
 
-Python 3.12+. Run any lesson's code with `python3 file.py`.
+Python 3.12+. Each lesson is a series of tiny programs, one concept each:
+`python3 n01.py`, then `n02.py`.
 
 | # | Lesson | You will practise |
 |---|--------|-------------------|

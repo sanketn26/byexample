@@ -1,23 +1,19 @@
 # C 02 — Control Flow
 
-`if`, `for`, `while`, `do…while`, `switch`, and `goto`. Conditions are
-integers: zero is false, anything else is true.
+`if`, `for`, `while`, `do`/`while`, `switch`, and `goto` all test integers:
+zero is false, anything else is true. The order of evaluation of function
+arguments, and of expressions like `a[i] = i++`, is unspecified or
+undefined. Do not depend on it.
 
-## Example
+## The three loops
 
-```c file=example.c
-#include <stddef.h>
+`for` and `while` test before the body. `do`/`while` runs the body once
+even when the condition is already false.
+
+```c file=n01.c
 #include <stdio.h>
 
-static int calls;
-
-static int side_effect(void) {
-    calls++;
-    return 1;
-}
-
 int main(void) {
-    /* The three loops */
     for (int i = 0; i < 3; i++) {
         printf("%d ", i);
     }
@@ -29,14 +25,34 @@ int main(void) {
     }
     printf("%d\n", n);
 
-    do { /* body always runs once */
+    do {
         n--;
     } while (n > 5);
     printf("%d\n", n);
+    return 0;
+}
+```
 
-    /* switch: falls through unless you break */
+```text output
+0 1 2 
+3
+2
+```
+
+## switch falls through until break
+
+Cases share a body until you `break`. That is how `0` and `6` both mean
+weekend, and how `1` prints two lines. An accidental fall-through is a
+classic bug. Mark a deliberate one with a comment (`/* fall through */`);
+C23 also has `[[fallthrough]]`. GCC's `-Wextra` includes
+`-Wimplicit-fallthrough`, which looks for that comment.
+
+```c file=n02.c
+#include <stdio.h>
+
+int main(void) {
     int days[] = {6, 1, 2, 9};
-    for (size_t i = 0; i < sizeof days / sizeof days[0]; i++) {
+    for (int i = 0; i < 4; i++) {
         switch (days[i]) {
         case 0:
         case 6:
@@ -52,8 +68,55 @@ int main(void) {
             puts("?");
         }
     }
+    return 0;
+}
+```
 
-    /* goto is the idiomatic way out of nested loops */
+```text output
+weekend
+start
+weekday
+weekday
+?
+```
+
+## A declaration in a case needs a block
+
+A `case` label cannot sit directly above a declaration: control could
+jump to the next label and skip the initializer. Wrap the case in braces.
+
+```c file=n03.c
+#include <stdio.h>
+
+int main(void) {
+    switch (1) {
+    case 1: {
+        int t = 7;
+        printf("%d\n", t);
+        break;
+    }
+    default:
+        break;
+    }
+    return 0;
+}
+```
+
+```text output
+7
+```
+
+## goto leaves nested loops
+
+A `goto` to a label after the loops is the usual way out when a `break`
+would only leave the inner one. Do not jump *into* the scope of a
+variable-length array, and do not jump over an initializer: that variable
+would be uninitialized.
+
+```c file=n04.c
+#include <stdio.h>
+
+int main(void) {
     int fi = 0, fj = 0;
     for (int i = 1; i < 5; i++) {
         for (int j = 1; j < 5; j++) {
@@ -66,8 +129,30 @@ int main(void) {
     }
 found:
     printf("found %d %d\n", fi, fj);
+    return 0;
+}
+```
 
-    /* && and || short-circuit */
+```text output
+found 2 3
+```
+
+## && and || skip the right side
+
+`&&` stops when the left side is false. `||` stops when the left side is
+true. The call that would increment `calls` never runs.
+
+```c file=n05.c
+#include <stdio.h>
+
+static int calls;
+
+static int side_effect(void) {
+    calls++;
+    return 1;
+}
+
+int main(void) {
     if (0 && side_effect()) {
         puts("never");
     }
@@ -75,18 +160,64 @@ found:
         /* right side skipped */
     }
     printf("%d\n", calls);
+    return 0;
+}
+```
 
-    /* Conditional operator */
+```text output
+0
+```
+
+## The conditional operator picks one expression
+
+`cond ? a : b` is an expression, not a statement. Only the chosen side is
+evaluated.
+
+```c file=n06.c
+#include <stdio.h>
+
+int main(void) {
     int k = 7;
     printf("%s\n", k % 2 ? "odd" : "even");
+    return 0;
+}
+```
 
-    /* Counting down with an unsigned index: i-- > 0 */
+```text output
+odd
+```
+
+## Count down with an unsigned index
+
+`for (size_t i = n - 1; i >= 0; i--)` never ends: an unsigned value is
+always `>= 0`, and the decrement wraps. Test `i-- > 0` instead. The body
+sees 2, then 1, then 0.
+
+```c file=n07.c
+#include <stddef.h>
+#include <stdio.h>
+
+int main(void) {
     for (size_t i = 3; i-- > 0;) {
         printf("%zu ", i);
     }
     printf("\n");
+    return 0;
+}
+```
 
-    /* continue */
+```text output
+2 1 0 
+```
+
+## continue skips the rest of the body
+
+Even indexes are ignored. The sum is the odds from 1 through 9.
+
+```c file=n08.c
+#include <stdio.h>
+
+int main(void) {
     int sum = 0;
     for (int i = 0; i < 10; i++) {
         if (i % 2 == 0) {
@@ -95,8 +226,23 @@ found:
         sum += i;
     }
     printf("%d\n", sum);
+    return 0;
+}
+```
 
-    /* Two loop variables with the comma operator */
+```text output
+25
+```
+
+## The comma operator sequences two expressions
+
+In a `for` header, the comma runs the left side, then the right, and
+yields the right. `i` climbs while `j` falls.
+
+```c file=n09.c
+#include <stdio.h>
+
+int main(void) {
     for (int i = 0, j = 5; i < j; i++, j--) {
         printf("%d-%d ", i, j);
     }
@@ -106,38 +252,58 @@ found:
 ```
 
 ```text output
-0 1 2 
-3
-2
-weekend
-start
-weekday
-weekday
-?
-found 2 3
-0
-odd
-2 1 0 
-25
 0-5 1-4 2-3 
 ```
 
-## Details that bite
+## An assignment in a condition stores
 
-- A `switch` case that falls through into the next one by accident is a
-  classic bug. Mark intentional fall-through with a comment (or
-  `[[fallthrough]]` in C23); `-Wextra` enforces it.
-- `for (size_t i = n - 1; i >= 0; i--)` is an **infinite loop** because
-  unsigned is always `>= 0`. Use `for (size_t i = n; i-- > 0;)`.
-- `if (x = 0)` assigns; wrap deliberate assignments in extra parentheses.
-- A stray semicolon (`if (c);`) makes an empty body. Always use braces,
-  even for one statement.
-- Declaring variables inside `case` labels needs a block:
-  `case 1: { int t = 0; … break; }`.
-- `goto` may not jump *into* the scope of a variable-length array, and
-  jumping over initialisers leaves variables uninitialised.
-- The order of evaluation of function arguments and of `a[i] = i++` is
-  unspecified or undefined; do not depend on it.
+`if (x = 0)` sets `x` to 0 and then tests it, so the branch is false.
+Extra parentheses, `if ((x = 0))`, are how you tell the compiler the
+assignment is deliberate. Without them, `-Wall` warns.
+
+```c file=n10.c
+#include <stdio.h>
+
+int main(void) {
+    int x = 1;
+    if ((x = 0)) {
+        puts("yes");
+    } else {
+        puts("no");
+    }
+    printf("%d\n", x);
+    return 0;
+}
+```
+
+```text output
+no
+0
+```
+
+## A stray semicolon is an empty body
+
+`if (c);` ends the `if`. The next statement always runs. `-Wempty-body`
+(part of `-Wextra`) flags the semicolon when it sits on the `if` line;
+a semicolon on the next line is the same empty body. Use braces even for
+a single statement.
+
+```c file=n11.c
+#include <stdio.h>
+
+int main(void) {
+    int c = 0;
+    if (c)
+        ;
+    puts("ran");
+    return 0;
+}
+```
+
+```text output
+ran
+```
+
 
 ## Exercises
 

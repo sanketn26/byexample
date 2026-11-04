@@ -1,13 +1,12 @@
 # Kubernetes 04 — Services and DNS
 
-Pods come and go and their IPs change. A **Service** is a stable name and
-virtual IP that load-balances across whichever Pods currently match its
-selector. Inside the cluster, DNS resolves `<service>` (same namespace) or
-`<service>.<namespace>.svc` to it.
+Pods come and go and their IPs change. A **Service** is a stable name and virtual IP that load-balances across whichever Pods currently match its selector. Inside the cluster, DNS resolves `<service>` (same namespace) or `<service>.<namespace>.svc` to it.
 
-## Example
+## A Service maps `port` to `targetPort`
 
-```bash file=example.sh
+`port` is what clients call. `targetPort` is the container's port. Swapping them yields "connection refused" from a healthy Pod. The default type, **ClusterIP**, is reachable only inside the cluster. `NodePort` and `LoadBalancer` expose it outward; for HTTP you usually add an Ingress or a Gateway. `kubectl port-forward svc/web 8080:80` reaches a ClusterIP from your laptop.
+
+```bash file=n01.sh
 #!/usr/bin/env bash
 set -euo pipefail
 ns=byex-$$
@@ -15,7 +14,109 @@ kubectl create namespace "$ns" >/dev/null
 trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
 k() { kubectl -n "$ns" "$@"; }
 
-# A tiny web server: busybox httpd serving one file.
+k apply -f - <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: main
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /www && echo \"served by $(hostname)\" > /www/index.html && httpd -f -p 8080 -h /www"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: {app: web}
+  ports:
+    - port: 80
+      targetPort: 8080
+YAML
+k get service web -o jsonpath='{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort}{"\n"}'
+```
+
+```text output
+deployment.apps/web created
+service/web created
+ClusterIP 80->8080
+```
+
+## Endpoints are the ready Pod IPs
+
+A Pod joins the endpoints only once it is Ready. A readiness probe takes a Pod out of rotation without killing it. Empty endpoints mean the selector or readiness is wrong, not the network. `kubectl get endpoints` is the first check when a Service "does not work".
+
+```bash file=n02.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k apply -f - <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: main
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /www && echo ok > /www/index.html && httpd -f -p 8080 -h /www"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: {app: web}
+  ports:
+    - port: 80
+      targetPort: 8080
+YAML
+k rollout status deployment/web --timeout=120s >/dev/null
+k get endpoints web -o jsonpath='{.subsets[0].addresses[*].ip}' | wc -w
+```
+
+```text output
+deployment.apps/web created
+service/web created
+2
+```
+
+## DNS resolves the Service name
+
+The short name `web` works only in the same namespace. From anywhere else use `web.<namespace>` or `web.<namespace>.svc.cluster.local`. The Service balances **connections**, not requests. A client that holds one keep-alive sticks to one Pod.
+
+```bash file=n03.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
 k apply -f - <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
@@ -47,21 +148,32 @@ spec:
       targetPort: 8080
 YAML
 k rollout status deployment/web --timeout=120s >/dev/null
-
-echo "--- the Service and its type"
-k get service web -o jsonpath='{.spec.type} {.spec.ports[0].port}->{.spec.ports[0].targetPort}{"\n"}'
-
-echo "--- endpoints: one per ready Pod"
-k get endpoints web -o jsonpath='{.subsets[0].addresses[*].ip}' | wc -w
-
-echo "--- call the Service by DNS name from another Pod"
 k run client --image=busybox:1.36 --restart=Never -- sleep 3600 >/dev/null
 k wait --for=condition=Ready pod/client --timeout=90s >/dev/null
 k exec client -- wget -qO- http://web | sed 's/web-.*/web-<pod>/'
 k exec client -- wget -qO- "http://web.$ns.svc.cluster.local" | sed 's/web-.*/web-<pod>/'
+```
 
-echo "--- a selector that matches nothing has no endpoints"
-k apply -f - <<'YAML' >/dev/null
+```text output
+deployment.apps/web created
+service/web created
+served by web-<pod>
+served by web-<pod>
+```
+
+## A selector that matches nothing has no endpoints
+
+The Service is created either way. `subsets` stays empty, which this jsonpath renders as a bare `|`.
+
+```bash file=n04.sh
+#!/usr/bin/env bash
+set -euo pipefail
+ns=byex-$$
+kubectl create namespace "$ns" >/dev/null
+trap 'kubectl delete namespace "$ns" --wait=false >/dev/null' EXIT
+k() { kubectl -n "$ns" "$@"; }
+
+k apply -f - >/dev/null <<'YAML'
 apiVersion: v1
 kind: Service
 metadata:
@@ -75,36 +187,8 @@ k get endpoints orphan -o jsonpath='{.subsets}{"|\n"}'
 ```
 
 ```text output
-deployment.apps/web created
-service/web created
---- the Service and its type
-ClusterIP 80->8080
---- endpoints: one per ready Pod
-2
---- call the Service by DNS name from another Pod
-served by web-<pod>
-served by web-<pod>
---- a selector that matches nothing has no endpoints
 |
 ```
-
-## Details that bite
-
-- `port` is what clients call; `targetPort` is the container's port. Mixing
-  them up gives "connection refused" with a perfectly healthy Pod.
-- The default type, **ClusterIP**, is reachable only inside the cluster.
-  `NodePort` and `LoadBalancer` expose it outward; for HTTP you normally
-  add an **Ingress** or Gateway on top.
-- A Pod only appears in the endpoints once it is **Ready**. That is how a
-  readiness probe (lesson 07) takes a Pod out of rotation without killing it.
-- DNS short names (`web`) work only within the same namespace. From
-  another namespace use `web.<ns>` or the full `web.<ns>.svc.cluster.local`.
-- The Service load-balances **connections**, not requests. A client that
-  holds one keep-alive connection sticks to one Pod.
-- `k get endpoints` is the first thing to check when a Service "does not
-  work": empty means selector or readiness, not networking.
-- `kubectl port-forward svc/web 8080:80` is the quick way to reach a
-  ClusterIP Service from your laptop while debugging.
 
 ## Exercises
 

@@ -1,12 +1,185 @@
 # Rust 02 — Control Flow
 
-Almost everything is an **expression**: `if`, `match` and blocks produce
-values. `match` is exhaustive — the compiler refuses to build if you miss a
-case.
+Almost everything is an expression: `if`, `match`, and a block all produce a
+value. `match` is exhaustive. The compiler refuses to build the program if
+a case is missing.
 
-## Example
+## `if` produces a value
 
-```rust file=example.rs
+Each branch has the same type, and the condition must be a `bool`. `if n {}`
+with an integer does not compile. There is no C-style `for (;;)` and no `++`.
+
+```rust file=n01.rs
+fn main() {
+    let n = 15;
+    let kind = if n % 15 == 0 {
+        "fizzbuzz"
+    } else if n % 3 == 0 {
+        "fizz"
+    } else {
+        "other"
+    };
+    println!("{kind}");
+}
+```
+
+```text output
+fizzbuzz
+```
+
+## A semicolon throws the value away
+
+`{ 5 }` is the value `5`. `{ 5; }` is the unit value `()`, because the
+semicolon turns the expression into a statement.
+
+```rust file=n02.rs
+fn main() {
+    let a = { 5 };
+    let b = { 5; };
+    println!("{a} {b:?}");
+}
+```
+
+```text output
+5 ()
+```
+
+## `loop` can break with a value
+
+`loop` runs until `break`. `break` may carry the value the whole loop
+evaluates to.
+
+```rust file=n03.rs
+fn main() {
+    let mut counter = 0;
+    let result = loop {
+        counter += 1;
+        if counter == 10 {
+            break counter * 2;
+        }
+    };
+    println!("{result}");
+}
+```
+
+```text output
+20
+```
+
+## `while` tests before each pass
+
+The body runs while the condition is `true`. `print!` does not add a newline,
+so the numbers stay on one line.
+
+```rust file=n04.rs
+fn main() {
+    let mut k = 3;
+    while k > 0 {
+        print!("{k} ");
+        k -= 1;
+    }
+    println!();
+}
+```
+
+```text output
+3 2 1 
+```
+
+## `for` walks a range or a borrow
+
+`0..3` excludes 3. `0..=3` includes it. A range whose start is past its end
+is empty, not an error. `for x in v` **moves** `v`. Write `for x in &v` or
+`for x in &mut v` to borrow it and keep the collection.
+
+```rust file=n05.rs
+fn main() {
+    for i in 0..3 {
+        print!("{i} ");
+    }
+    println!();
+    let v = vec![10, 20, 30];
+    for x in &v {
+        print!("{x} ");
+    }
+    println!("{}", v.len());
+    println!("{} {}", (0..=3).contains(&3), (3..1).count());
+}
+```
+
+```text output
+0 1 2 
+10 20 30 3
+true 0
+```
+
+## `.rev()` needs an exact end
+
+`.rev()` only works on a double-ended iterator whose size is known.
+`(0..7).step_by(3).rev()` compiles. `(0..=6).step_by(3).rev()` does not.
+Collect into a `Vec`, or rebuild the range.
+
+```rust file=n06.rs
+fn main() {
+    for i in (0..7).step_by(3).rev() {
+        print!("{i} ");
+    }
+    println!();
+}
+```
+
+```text output
+6 3 0 
+```
+
+## `enumerate` numbers the items
+
+The index comes from the iterator, not from the characters themselves.
+
+```rust file=n07.rs
+fn main() {
+    for (i, ch) in "abc".chars().enumerate() {
+        print!("{i}{ch} ");
+    }
+    println!();
+}
+```
+
+```text output
+0a 1b 2c 
+```
+
+## A label names which loop breaks
+
+`break` without a label leaves the innermost loop. `'outer: for ...` and
+`break 'outer` leave the loop you named.
+
+```rust file=n08.rs
+fn main() {
+    let mut found = None;
+    'outer: for i in 1..5 {
+        for j in 1..5 {
+            if i * j == 6 {
+                found = Some((i, j));
+                break 'outer;
+            }
+        }
+    }
+    println!("{found:?}");
+}
+```
+
+```text output
+Some((2, 3))
+```
+
+## `match` arms cover every value
+
+Ranges, `|` alternatives, and `if` guards are patterns. Every arm has the
+same type, and something must match. `_` is the catch-all. Skip it on your
+own enums so adding a variant breaks the build, which is what you want.
+
+```rust file=n09.rs
 fn classify(n: i32) -> &'static str {
     match n {
         i32::MIN..=-1 => "negative",
@@ -18,76 +191,65 @@ fn classify(n: i32) -> &'static str {
 }
 
 fn main() {
-    // `if` is an expression
-    let n = 15;
-    let kind = if n % 15 == 0 {
-        "fizzbuzz"
-    } else if n % 3 == 0 {
-        "fizz"
-    } else {
-        "other"
-    };
-    println!("{kind}");
-
-    // `loop` can break with a value
-    let mut counter = 0;
-    let result = loop {
-        counter += 1;
-        if counter == 10 {
-            break counter * 2;
-        }
-    };
-    println!("{result}");
-
-    // while
-    let mut k = 3;
-    while k > 0 {
-        print!("{k} ");
-        k -= 1;
-    }
-    println!();
-
-    // for over ranges and iterators
-    for i in 0..3 {
-        print!("{i} ");
-    }
-    println!();
-    for i in (0..7).step_by(3).rev() {
-        print!("{i} ");
-    }
-    println!();
-    for (i, ch) in "abc".chars().enumerate() {
-        print!("{i}{ch} ");
-    }
-    println!();
-
-    // Labelled breaks
-    let mut found = None;
-    'outer: for i in 1..5 {
-        for j in 1..5 {
-            if i * j == 6 {
-                found = Some((i, j));
-                break 'outer;
-            }
-        }
-    }
-    println!("{found:?}");
-
-    // match with ranges, alternatives and guards
     for n in [-5, 0, 2, 10, 11] {
         print!("{} ", classify(n));
     }
     println!();
+}
+```
 
-    // Destructuring in patterns
+```text output
+negative zero small big even big odd 
+```
+
+## A pattern can move the value out
+
+Matching `(x, y)` on a pair of `String` would move `x`. Match `&pair` (or
+write `ref`) when you only want to look and still use the original.
+
+```rust file=n10.rs
+fn main() {
+    let pair = (String::from("hi"), 1);
+    match &pair {
+        (s, n) => println!("{s} {n}"),
+    }
+    println!("{}", pair.0);
+}
+```
+
+```text output
+hi 1
+hi
+```
+
+## Patterns also test one shape
+
+The pair below is two opposites, so the guard `x + y == 0` wins before the
+odd-x arm.
+
+```rust file=n11.rs
+fn main() {
     let pair = (3, -3);
     match pair {
         (x, y) if x + y == 0 => println!("opposites"),
         (x, _) if x % 2 == 1 => println!("odd x"),
         _ => println!("other"),
     }
+}
+```
 
-    // if let, let-else, while let, matches!
+```text output
+opposites
+```
+
+## `if let` and `while let` match one arm
+
+`if let` runs the body only when the pattern fits. `let`/`else` leaves the
+function when it does not. `while let` loops until the pattern fails.
+`matches!` is the same test as a boolean.
+
+```rust file=n12.rs
+fn main() {
     let maybe = Some(5);
     if let Some(v) = maybe {
         println!("got {v}");
@@ -106,38 +268,11 @@ fn main() {
 ```
 
 ```text output
-fizzbuzz
-20
-3 2 1 
-0 1 2 
-6 3 0 
-0a 1b 2c 
-Some((2, 3))
-negative zero small big even big odd 
-opposites
 got 5
 10
 3 2 1 
 true
 ```
-
-## Details that bite
-
-- Conditions must be `bool`: `if n {}` with an integer does not compile.
-- `match` arms must all have the same type, and the match must be
-  exhaustive. `_` is the catch-all; avoid it when matching your own enums
-  so that adding a variant breaks the build (which is what you want).
-- Ranges: `0..3` excludes 3, `0..=3` includes it. `a..b` with `a > b` is
-  just empty.
-- A trailing semicolon turns an expression into a statement:
-  `{ 5 }` is `5`, `{ 5; }` is `()`.
-- `for x in v` **moves** `v`; use `for x in &v` or `for x in &mut v` to
-  borrow.
-- There is no C-style `for (;;)` and no `++`.
-- `.rev()` needs a double-ended, exact-size iterator: `(0..7).step_by(3).rev()`
-  works but `(0..=6).step_by(3).rev()` does not compile. Collect or restructure.
-- Binding patterns in `match` can move values out; use `ref` or match on
-  `&value` when you only want to look.
 
 ## Exercises
 

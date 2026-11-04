@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+NUGGET = re.compile(r"^(example|n\d+)$")
+
 FENCE = re.compile(r"^```(\w+)([^\n]*)\n(.*?)^```", re.S | re.M)
 
 RUN = {
@@ -54,10 +56,13 @@ def main():
         written.append(name)
 
     print(f"wrote {', '.join(written)} to {dest}/")
+    tools = Path(__file__).resolve().parent
     for name in written:
-        if name.startswith("exercise"):
-            cmd = RUN[lang].format(f=name, b=Path(name).stem, tools=Path(__file__).resolve().parent)
-            print(f"practise:  cd {dest} && {cmd}")
+        kind = Path(name).stem
+        if NUGGET.match(kind) or kind == "exercise":
+            cmd = RUN[lang].format(f=name, b=kind, tools=tools)
+            label = "practise" if kind == "exercise" else "run"
+            print(f"{label}:  cd {dest} && {cmd}")
 
 
 if __name__ == "__main__":

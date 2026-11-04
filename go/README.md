@@ -1,6 +1,7 @@
 # Go by Example (practice edition)
 
-Go 1.23+. Each lesson is a single `package main` file: `go run file.go`.
+Go 1.23+. Each lesson is a series of tiny `package main` programs, one concept
+each: `go run n01.go`, then `n02.go`.
 Exercises use a tiny `check` helper and exit non-zero until solved.
 
 | # | Lesson | You will practise |
