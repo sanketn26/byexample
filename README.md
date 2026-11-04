@@ -84,7 +84,8 @@ Toolchains it needs on `PATH`: `python3` (3.12+), `go` (1.23+), `rustc`
 (2021 edition, built with `-D warnings`), `gcc` (C11, built with
 `-Wall -Wextra -Werror -fsanitize=address,undefined`), `bash` 4.4+ with `jq`
 (shell), and a PostgreSQL 16 container named `byexample-pg` (sql, via
-`tools/sqlrun.py`).
+`tools/sqlrun.py`). Start that container with `make pg-up` and remove it
+with `make pg-down`.
 
 ## Contributing a lesson
 

@@ -316,11 +316,11 @@ CREATE TABLE account (
 );
 INSERT INTO account VALUES (1, 'ada', 100), (2, 'bob', 50), (3, 'cy', 0);
 
--- 1. Transfer 40 from ada (1) to cy (3) in ONE transaction
---    (BEGIN/COMMIT, or one DO block).
--- 2. Try to transfer 500 from bob (2) to cy (3): the debit violates the
---    CHECK. Mark the failing statement with -- expect-error, then ROLLBACK
---    (or let the DO block fail) so the credit never happens.
+-- 1. Transfer 40 from ada (1) to cy (3) in one DO block, so both updates
+--    commit together.
+-- 2. Try to transfer 500 from bob (2) to cy (3) in one DO block. The debit
+--    violates the CHECK. Mark that block with -- expect-error. The block
+--    fails, so the credit never lands and bob stays at 50.
 -- 3. Take 10 from bob (2) with ONE guarded UPDATE that only succeeds if bob
 --    has at least 10 (no separate SELECT).
 -- TODO: write the statements here
@@ -345,15 +345,20 @@ CREATE TABLE account (
 );
 INSERT INTO account VALUES (1, 'ada', 100), (2, 'bob', 50), (3, 'cy', 0);
 
-BEGIN;
-UPDATE account SET balance = balance - 40 WHERE id = 1;
-UPDATE account SET balance = balance + 40 WHERE id = 3;
-COMMIT;
+DO $body$
+BEGIN
+  UPDATE account SET balance = balance - 40 WHERE id = 1;
+  UPDATE account SET balance = balance + 40 WHERE id = 3;
+END
+$body$;
 
-BEGIN;
 -- expect-error
-UPDATE account SET balance = balance - 500 WHERE id = 2;
-ROLLBACK;
+DO $body$
+BEGIN
+  UPDATE account SET balance = balance - 500 WHERE id = 2;
+  UPDATE account SET balance = balance + 500 WHERE id = 3;
+END
+$body$;
 
 UPDATE account SET balance = balance - 10 WHERE id = 2 AND balance >= 10;
 

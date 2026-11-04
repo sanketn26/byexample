@@ -109,6 +109,11 @@ def split_statements(text):
             end = text.find("\n", i)
             i = n if end < 0 else end
             continue
+        # Block comments are not nested. A semicolon inside one is not a split.
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
         if ch == ";":
             statement = "".join(buf).strip()
             if statement:

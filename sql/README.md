@@ -1,7 +1,8 @@
 # SQL by Example (practice edition)
 
-Runs on **PostgreSQL 16** in the Docker container `byexample-pg`. Each
-lesson is a series of tiny scripts, one concept each. The course runner
+Runs on **PostgreSQL 16** in the Docker container `byexample-pg`. Start it
+with `make pg-up` before `make verify-sql`, and stop it with `make pg-down`.
+Each lesson is a series of tiny scripts, one concept each. The course runner
 creates a throwaway database, prints rows as `a|b|c`, and prints booleans
 as `t` and `f`:
 
